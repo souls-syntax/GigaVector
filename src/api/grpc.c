@@ -165,6 +165,89 @@ int grpc_encode_add_request(const float *data, size_t dimension,
     return GV_GRPC_OK;
 }
 
+int grpc_encode_ivfdisk_train_request(const float *data, size_t count, size_t dimension,
+                                      uint8_t *buf, size_t buf_size, size_t *out_len) {
+    (void)data;
+    (void)count;
+    (void)dimension;
+    (void)buf;
+    (void)buf_size;
+    (void)out_len;
+    return GV_GRPC_ERROR_NOT_RUNNING;
+}
+
+int grpc_client_ivfdisk_train(const char *host, uint16_t port,
+                              const float *data, size_t count, size_t dimension,
+                              uint32_t timeout_ms) {
+    (void)host;
+    (void)port;
+    (void)data;
+    (void)count;
+    (void)dimension;
+    (void)timeout_ms;
+    return -1;
+}
+
+int grpc_client_search(const char *host, uint16_t port,
+                         const float *query, size_t dimension, size_t k,
+                         int distance_type, GV_GrpcSearchResponse *out,
+                         uint32_t timeout_ms) {
+    (void)host;
+    (void)port;
+    (void)query;
+    (void)dimension;
+    (void)k;
+    (void)distance_type;
+    (void)out;
+    (void)timeout_ms;
+    return -1;
+}
+
+void grpc_search_response_free(GV_GrpcSearchResponse *resp) {
+    if (!resp) return;
+    free(resp->indices);
+    free(resp->distances);
+    resp->indices = NULL;
+    resp->distances = NULL;
+    resp->count = 0;
+}
+
+int grpc_decode_frame(const uint8_t *data, size_t len, size_t max_bytes, GV_GrpcMessage *msg) {
+    if (!data || !msg) return GV_GRPC_ERROR_NULL;
+    memset(msg, 0, sizeof(*msg));
+    if (len < 9) return GV_GRPC_ERROR_CONFIG;
+
+    msg->length = read_u32_be(data);
+    if (msg->length < 5 || msg->length > max_bytes) return GV_GRPC_ERROR_CONFIG;
+    if (len < 4u + msg->length) return GV_GRPC_ERROR_CONFIG;
+
+    msg->msg_type = data[4];
+    msg->request_id = read_u32_be(data + 5);
+    msg->payload_len = msg->length - 5;
+    if (msg->payload_len > 0) {
+        msg->payload = (uint8_t *)malloc(msg->payload_len);
+        if (!msg->payload) return GV_GRPC_ERROR_MEMORY;
+        memcpy(msg->payload, data + 9, msg->payload_len);
+    }
+    return GV_GRPC_OK;
+}
+
+void grpc_message_free(GV_GrpcMessage *msg) {
+    if (!msg) return;
+    free(msg->payload);
+    msg->payload = NULL;
+    msg->payload_len = 0;
+    msg->length = 0;
+}
+
+int grpc_fuzz_dispatch_message(GV_GrpcServer *server, int response_fd,
+                               const GV_GrpcMessage *msg) {
+    (void)server;
+    (void)response_fd;
+    (void)msg;
+    return GV_GRPC_ERROR_NOT_RUNNING;
+}
+
 #else  /* POSIX implementation below */
 
 #include <stdlib.h>
@@ -178,6 +261,7 @@ int grpc_encode_add_request(const float *data, size_t dimension,
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <time.h>
 #include <signal.h>
 
@@ -528,21 +612,7 @@ static void handle_search(GV_GrpcServer *server, int fd,
 
     write_u32_be(resp, (uint32_t)found);
     for (int i = 0; i < found; i++) {
-        /* Extract index from the result. For dense vectors, use vector pointer
-         * comparison approach; for simplicity, we encode a sequential index. */
-        uint32_t idx = 0;
-        if (results[i].vector) {
-            /* The vector field is a pointer into SoA storage; we need the actual
-             * index. GV_SearchResult doesn't carry an explicit index for dense
-             * results, so we use the distance-ranked position. The proper way
-             * would require the search API to populate an index field. For now,
-             * we encode the rank position. */
-            idx = (uint32_t)i;
-        }
-        if (results[i].is_sparse && results[i].sparse_vector) {
-            idx = (uint32_t)i;
-        }
-        write_u32_be(resp + 4 + (size_t)i * 8, idx);
+        write_u32_be(resp + 4 + (size_t)i * 8, (uint32_t)results[i].id);
         write_float_be(resp + 4 + (size_t)i * 8 + 4, results[i].distance);
     }
 
@@ -875,6 +945,107 @@ static void handle_save(GV_GrpcServer *server, int fd,
 }
 
 /**
+ * @brief Handle GV_MSG_IVFDISK_TRAIN.
+ *
+ * Request payload: [4-byte count][count * dimension * 4-byte floats]
+ * Response payload: [4-byte status (0 = ok)]
+ */
+static void handle_ivfdisk_train(GV_GrpcServer *server, int fd,
+                                  const GV_GrpcMessage *msg) {
+    if (server->db->index_type != GV_INDEX_TYPE_IVFDISK) {
+        send_error_response(fd, msg->request_id, -1, "database is not IVFDisk");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+    if (msg->payload_len < 8) {
+        send_error_response(fd, msg->request_id, -1, "payload too short");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
+    uint32_t count = read_u32_be(msg->payload);
+    uint32_t dimension = read_u32_be(msg->payload + 4);
+    size_t expected = 8 + (size_t)count * (size_t)dimension * sizeof(float);
+    if (count == 0 || msg->payload_len < expected) {
+        send_error_response(fd, msg->request_id, -1, "incomplete train data");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
+    size_t total_floats = (size_t)count * (size_t)dimension;
+    if (dimension != (uint32_t)server->db->dimension) {
+        send_error_response(fd, msg->request_id, -1, "dimension mismatch");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
+    float *data = malloc(total_floats * sizeof(float));
+    if (!data) {
+        send_error_response(fd, msg->request_id, -1, "out of memory");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+    for (size_t i = 0; i < total_floats; i++) {
+        data[i] = read_float_be(msg->payload + 8 + i * 4);
+    }
+
+    int rc = db_ivfdisk_train(server->db, data, (size_t)count, (size_t)dimension);
+    free(data);
+
+    uint8_t resp[4];
+    write_u32_be(resp, (uint32_t)rc);
+    send_message(fd, GV_MSG_RESPONSE, msg->request_id, resp, 4);
+    if (rc != 0) {
+        GV_ATOMIC_INC(&server->errors);
+    }
+}
+
+/**
+ * @brief Process one decoded message (shared by handle_connection and fuzz harness).
+ */
+static void dispatch_message(GV_GrpcServer *server, int fd, const GV_GrpcMessage *msg) {
+    switch (msg->msg_type) {
+        case GV_MSG_ADD_VECTOR:
+            handle_add_vector(server, fd, msg);
+            break;
+        case GV_MSG_SEARCH:
+            handle_search(server, fd, msg);
+            break;
+        case GV_MSG_DELETE:
+            handle_delete(server, fd, msg);
+            break;
+        case GV_MSG_UPDATE:
+            handle_update(server, fd, msg);
+            break;
+        case GV_MSG_GET:
+            handle_get(server, fd, msg);
+            break;
+        case GV_MSG_BATCH_ADD:
+            handle_batch_add(server, fd, msg);
+            break;
+        case GV_MSG_BATCH_SEARCH:
+            handle_batch_search(server, fd, msg);
+            break;
+        case GV_MSG_STATS:
+            handle_stats(server, fd, msg);
+            break;
+        case GV_MSG_HEALTH:
+            handle_health(server, fd, msg);
+            break;
+        case GV_MSG_SAVE:
+            handle_save(server, fd, msg);
+            break;
+        case GV_MSG_IVFDISK_TRAIN:
+            handle_ivfdisk_train(server, fd, msg);
+            break;
+        default:
+            send_error_response(fd, msg->request_id, -1, "unknown message type");
+            GV_ATOMIC_INC(&server->errors);
+            break;
+    }
+}
+
+/**
  * @brief Process one client connection: read messages in a loop until
  *        the client disconnects or an error occurs.
  */
@@ -898,42 +1069,7 @@ static void handle_connection(GV_GrpcServer *server, int client_fd) {
         GV_ATOMIC_INC(&server->total_requests);
         GV_ATOMIC_ADD(&server->bytes_received, 4 + msg.length);
 
-        switch (msg.msg_type) {
-            case GV_MSG_ADD_VECTOR:
-                handle_add_vector(server, client_fd, &msg);
-                break;
-            case GV_MSG_SEARCH:
-                handle_search(server, client_fd, &msg);
-                break;
-            case GV_MSG_DELETE:
-                handle_delete(server, client_fd, &msg);
-                break;
-            case GV_MSG_UPDATE:
-                handle_update(server, client_fd, &msg);
-                break;
-            case GV_MSG_GET:
-                handle_get(server, client_fd, &msg);
-                break;
-            case GV_MSG_BATCH_ADD:
-                handle_batch_add(server, client_fd, &msg);
-                break;
-            case GV_MSG_BATCH_SEARCH:
-                handle_batch_search(server, client_fd, &msg);
-                break;
-            case GV_MSG_STATS:
-                handle_stats(server, client_fd, &msg);
-                break;
-            case GV_MSG_HEALTH:
-                handle_health(server, client_fd, &msg);
-                break;
-            case GV_MSG_SAVE:
-                handle_save(server, client_fd, &msg);
-                break;
-            default:
-                send_error_response(client_fd, msg.request_id, -1, "unknown message type");
-                GV_ATOMIC_INC(&server->errors);
-                break;
-        }
+        dispatch_message(server, client_fd, &msg);
 
         uint64_t elapsed_us = grpc_now_us() - start_us;
         GV_ATOMIC_ADD(&server->total_latency_us, elapsed_us);
@@ -1311,6 +1447,230 @@ int grpc_encode_add_request(const float *data, size_t dimension,
     }
 
     *out_len = needed;
+    return GV_GRPC_OK;
+}
+
+int grpc_encode_ivfdisk_train_request(const float *data, size_t count, size_t dimension,
+                                      uint8_t *buf, size_t buf_size, size_t *out_len) {
+    if (!data || !buf || !out_len || count == 0 || dimension == 0) return GV_GRPC_ERROR_NULL;
+
+    size_t needed = 8 + count * dimension * sizeof(float);
+    if (buf_size < needed) return GV_GRPC_ERROR_CONFIG;
+
+    write_u32_be(buf, (uint32_t)count);
+    write_u32_be(buf + 4, (uint32_t)dimension);
+    for (size_t i = 0; i < count * dimension; i++) {
+        write_float_be(buf + 8 + i * 4, data[i]);
+    }
+    *out_len = needed;
+    return GV_GRPC_OK;
+}
+
+int grpc_client_ivfdisk_train(const char *host, uint16_t port,
+                              const float *data, size_t count, size_t dimension,
+                              uint32_t timeout_ms) {
+    if (!host || !data || count == 0 || dimension == 0) return -1;
+    (void)timeout_ms;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return -1;
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return -1;
+
+    size_t payload_cap = 8 + count * dimension * sizeof(float);
+    uint8_t *payload = (uint8_t *)malloc(payload_cap);
+    if (!payload) {
+        close(fd);
+        return -1;
+    }
+
+    size_t payload_len = 0;
+    if (grpc_encode_ivfdisk_train_request(data, count, dimension,
+                                          payload, payload_cap, &payload_len) != 0) {
+        free(payload);
+        close(fd);
+        return -1;
+    }
+
+    if (send_message(fd, GV_MSG_IVFDISK_TRAIN, 1, payload, payload_len) != 0) {
+        free(payload);
+        close(fd);
+        return -1;
+    }
+    free(payload);
+
+    GV_GrpcMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    if (recv_message(fd, &msg, 16 * 1024 * 1024) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (msg.msg_type != GV_MSG_RESPONSE || !msg.payload || msg.payload_len < 4) {
+        free(msg.payload);
+        return -1;
+    }
+
+    int32_t status = (int32_t)read_u32_be(msg.payload);
+    free(msg.payload);
+    return status == 0 ? 0 : -1;
+}
+
+int grpc_client_search(const char *host, uint16_t port,
+                         const float *query, size_t dimension, size_t k,
+                         int distance_type, GV_GrpcSearchResponse *out,
+                         uint32_t timeout_ms) {
+    if (!host || !query || !out || dimension == 0 || k == 0) return -1;
+    memset(out, 0, sizeof(*out));
+    (void)timeout_ms;
+
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) return -1;
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return -1;
+
+    uint8_t payload[65536];
+    size_t payload_len = 0;
+    if (grpc_encode_search_request(query, dimension, k, distance_type,
+                                   payload, sizeof(payload), &payload_len) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    if (send_message(fd, GV_MSG_SEARCH, 1, payload, payload_len) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    GV_GrpcMessage msg;
+    memset(&msg, 0, sizeof(msg));
+    if (recv_message(fd, &msg, 16 * 1024 * 1024) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+
+    if (msg.msg_type != GV_MSG_RESPONSE || !msg.payload || msg.payload_len < 4) {
+        free(msg.payload);
+        return -1;
+    }
+
+    if ((int32_t)read_u32_be(msg.payload) < 0) {
+        free(msg.payload);
+        return -1;
+    }
+
+    uint32_t count = read_u32_be(msg.payload);
+    if (msg.payload_len < 4 + (size_t)count * 8) {
+        free(msg.payload);
+        return -1;
+    }
+
+    out->count = count;
+    if (count == 0) {
+        free(msg.payload);
+        return 0;
+    }
+
+    out->indices = malloc((size_t)count * sizeof(size_t));
+    out->distances = malloc((size_t)count * sizeof(float));
+    if (!out->indices || !out->distances) {
+        free(out->indices);
+        free(out->distances);
+        free(msg.payload);
+        out->indices = NULL;
+        out->distances = NULL;
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        out->indices[i] = (size_t)read_u32_be(msg.payload + 4 + (size_t)i * 8);
+        out->distances[i] = read_float_be(msg.payload + 4 + (size_t)i * 8 + 4);
+    }
+    free(msg.payload);
+    return (int)count;
+}
+
+void grpc_search_response_free(GV_GrpcSearchResponse *resp) {
+    if (!resp) return;
+    free(resp->indices);
+    free(resp->distances);
+    resp->indices = NULL;
+    resp->distances = NULL;
+    resp->count = 0;
+}
+
+int grpc_decode_frame(const uint8_t *data, size_t len, size_t max_bytes, GV_GrpcMessage *msg) {
+    if (!data || !msg) return GV_GRPC_ERROR_NULL;
+    memset(msg, 0, sizeof(*msg));
+    if (len < 9) return GV_GRPC_ERROR_CONFIG;
+
+    msg->length = read_u32_be(data);
+    if (msg->length < 5 || msg->length > max_bytes) return GV_GRPC_ERROR_CONFIG;
+    if (len < 4u + msg->length) return GV_GRPC_ERROR_CONFIG;
+
+    msg->msg_type = data[4];
+    msg->request_id = read_u32_be(data + 5);
+    msg->payload_len = msg->length - 5;
+    if (msg->payload_len > 0) {
+        msg->payload = (uint8_t *)malloc(msg->payload_len);
+        if (!msg->payload) return GV_GRPC_ERROR_MEMORY;
+        memcpy(msg->payload, data + 9, msg->payload_len);
+    }
+    return GV_GRPC_OK;
+}
+
+void grpc_message_free(GV_GrpcMessage *msg) {
+    if (!msg) return;
+    free(msg->payload);
+    msg->payload = NULL;
+    msg->payload_len = 0;
+    msg->length = 0;
+}
+
+int grpc_fuzz_dispatch_message(GV_GrpcServer *server, int response_fd,
+                               const GV_GrpcMessage *msg) {
+    if (!server || !msg) return GV_GRPC_ERROR_NULL;
+    if (response_fd < 0) return GV_GRPC_ERROR_CONFIG;
+
+    GV_ATOMIC_INC(&server->total_requests);
+    GV_ATOMIC_ADD(&server->bytes_received, 4 + msg->length);
+    dispatch_message(server, response_fd, msg);
     return GV_GRPC_OK;
 }
 

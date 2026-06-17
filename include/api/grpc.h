@@ -33,6 +33,7 @@ typedef enum {
     GV_MSG_STATS = 8,
     GV_MSG_HEALTH = 9,
     GV_MSG_SAVE = 10,
+    GV_MSG_IVFDISK_TRAIN = 11,
     GV_MSG_RESPONSE = 128
 } GV_GrpcMsgType;
 
@@ -114,6 +115,44 @@ int grpc_decode_search_request(const uint8_t *buf, size_t len,
                                    float **query, size_t *dimension, size_t *k, int *distance_type);
 int grpc_encode_add_request(const float *data, size_t dimension,
                                 uint8_t *buf, size_t buf_size, size_t *out_len);
+
+/** Payload: [4-byte count][4-byte dimension][count * dimension floats] */
+int grpc_encode_ivfdisk_train_request(const float *data, size_t count, size_t dimension,
+                                      uint8_t *buf, size_t buf_size, size_t *out_len);
+
+/** Train IVFDisk centroids on a remote server. Returns 0 on success, -1 on error. */
+int grpc_client_ivfdisk_train(const char *host, uint16_t port,
+                              const float *data, size_t count, size_t dimension,
+                              uint32_t timeout_ms);
+
+/** Parse a complete wire frame from @p data (for fuzzing / in-memory dispatch). */
+int grpc_decode_frame(const uint8_t *data, size_t len, size_t max_bytes, GV_GrpcMessage *msg);
+void grpc_message_free(GV_GrpcMessage *msg);
+
+/**
+ * Dispatch one decoded message through server handlers (response written to @p response_fd).
+ * Used by libFuzzer without starting the network server.
+ */
+int grpc_fuzz_dispatch_message(GV_GrpcServer *server, int response_fd,
+                               const GV_GrpcMessage *msg);
+
+typedef struct {
+    size_t count;
+    size_t *indices;
+    float *distances;
+} GV_GrpcSearchResponse;
+
+/**
+ * @brief Execute a vector search against a remote gRPC-style server.
+ *
+ * @return Number of hits on success, 0 when empty, -1 on error.
+ */
+int grpc_client_search(const char *host, uint16_t port,
+                         const float *query, size_t dimension, size_t k,
+                         int distance_type, GV_GrpcSearchResponse *out,
+                         uint32_t timeout_ms);
+
+void grpc_search_response_free(GV_GrpcSearchResponse *resp);
 
 #ifdef __cplusplus
 }

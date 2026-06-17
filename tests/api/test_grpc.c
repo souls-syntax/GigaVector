@@ -2,7 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "api/grpc.h"
+#include "index/ivfdisk.h"
 #include "storage/database.h"
+#include "../test_tmp.h"
 
 #define ASSERT(cond, msg) do { if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); return -1; } } while(0)
 
@@ -235,6 +237,65 @@ static int test_grpc_encode_add_request_small_buf(void) {
     return 0;
 }
 
+static int test_grpc_encode_ivfdisk_train_request(void) {
+    float data[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+    uint8_t buf[64];
+    size_t out_len = 0;
+
+    int rc = grpc_encode_ivfdisk_train_request(data, 2, 4, buf, sizeof(buf), &out_len);
+    ASSERT(rc == 0, "encode ivfdisk train should succeed");
+    ASSERT(out_len == 8 + 2 * 4 * sizeof(float), "payload length");
+    return 0;
+}
+
+static int test_grpc_client_ivfdisk_train(void) {
+    char db_path[256];
+    if (gv_test_make_temp_path(db_path, sizeof(db_path), "gv_grpc_ivf", ".gv") != 0) return 0;
+    remove(db_path);
+
+    GV_IVFDiskConfig cfg;
+    ivfdisk_config_init(&cfg);
+    cfg.nlist = 4;
+    cfg.nprobe = 2;
+
+    GV_Database *db = db_open_with_ivfdisk_config(db_path, 4, GV_INDEX_TYPE_IVFDISK, &cfg);
+    ASSERT(db != NULL, "open ivfdisk db");
+
+    GV_GrpcConfig config;
+    grpc_config_init(&config);
+    config.port = 50178;
+    config.bind_address = "127.0.0.1";
+
+    GV_GrpcServer *server = grpc_create(db, &config);
+    ASSERT(server != NULL, "grpc_create");
+
+    if (grpc_start(server) != 0) {
+        printf("(SKIPPED - port binding may be restricted in this environment)\n");
+        grpc_destroy(server);
+        db_close(db);
+        remove(db_path);
+        return 0;
+    }
+
+    float train[16] = {
+        0.f, 0.f, 0.f, 0.f,
+        1.f, 0.f, 0.f, 0.f,
+        0.f, 1.f, 0.f, 0.f,
+        1.f, 1.f, 0.f, 0.f,
+    };
+    int rc = grpc_client_ivfdisk_train("127.0.0.1", 50178, train, 4, 4, 5000);
+    ASSERT(rc == 0, "client ivfdisk train should succeed");
+
+    float v[4] = {0.1f, 0.1f, 0.f, 0.f};
+    ASSERT(db_add_vector(db, v, 4) == 0, "insert after remote train");
+
+    grpc_stop(server);
+    grpc_destroy(server);
+    db_close(db);
+    remove(db_path);
+    return 0;
+}
+
 static int test_grpc_get_stats_initial(void) {
     GV_Database *db = db_open(NULL, 4, GV_INDEX_TYPE_FLAT);
     ASSERT(db != NULL, "create test database");
@@ -326,7 +387,45 @@ static int test_grpc_msg_type_values(void) {
     ASSERT(GV_MSG_STATS == 8, "GV_MSG_STATS should be 8");
     ASSERT(GV_MSG_HEALTH == 9, "GV_MSG_HEALTH should be 9");
     ASSERT(GV_MSG_SAVE == 10, "GV_MSG_SAVE should be 10");
+    ASSERT(GV_MSG_IVFDISK_TRAIN == 13, "GV_MSG_IVFDISK_TRAIN should be 13");
     ASSERT(GV_MSG_RESPONSE == 128, "GV_MSG_RESPONSE should be 128");
+    return 0;
+}
+
+static int test_grpc_client_search(void) {
+    GV_Database *db = db_open(NULL, 4, GV_INDEX_TYPE_FLAT);
+    ASSERT(db != NULL, "create test database");
+
+    float v[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    ASSERT(db_add_vector(db, v, 4) == 0, "add vector for remote search");
+
+    GV_GrpcConfig config;
+    grpc_config_init(&config);
+    config.port = 50177;
+    config.bind_address = "127.0.0.1";
+
+    GV_GrpcServer *server = grpc_create(db, &config);
+    ASSERT(server != NULL, "grpc_create should succeed");
+
+    if (grpc_start(server) != 0) {
+        printf("(SKIPPED - port binding may be restricted in this environment)\n");
+        grpc_destroy(server);
+        db_close(db);
+        return 0;
+    }
+
+    float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    GV_GrpcSearchResponse resp;
+    memset(&resp, 0, sizeof(resp));
+    int found = grpc_client_search("127.0.0.1", 50177, q, 4, 1, 0, &resp, 5000);
+    ASSERT(found == 1, "client search should return one hit");
+    ASSERT(resp.count == 1, "response count should be 1");
+    ASSERT(resp.indices != NULL && resp.indices[0] == 0, "remote search returns vector index 0");
+
+    grpc_search_response_free(&resp);
+    grpc_stop(server);
+    grpc_destroy(server);
+    db_close(db);
     return 0;
 }
 
@@ -348,11 +447,14 @@ int main(void) {
         {"Testing grpc_decode_search_invalid...", test_grpc_decode_search_request_invalid},
         {"Testing grpc_encode_add_request...", test_grpc_encode_add_request},
         {"Testing grpc_encode_add_small_buf...", test_grpc_encode_add_request_small_buf},
+        {"Testing grpc_encode_ivfdisk_train...", test_grpc_encode_ivfdisk_train_request},
         {"Testing grpc_get_stats_initial...", test_grpc_get_stats_initial},
         {"Testing grpc_get_stats_null...", test_grpc_get_stats_null},
         {"Testing grpc_start_stop...", test_grpc_start_stop},
         {"Testing grpc_stop_null...", test_grpc_stop_null},
         {"Testing grpc_msg_type_values...", test_grpc_msg_type_values},
+        {"Testing grpc_client_search...", test_grpc_client_search},
+        {"Testing grpc_client_ivfdisk_train...", test_grpc_client_ivfdisk_train},
     };
     int n = sizeof(tests) / sizeof(tests[0]);
     int passed = 0;
