@@ -69,11 +69,16 @@ static ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
 #include "multimodal/metadata_index.h"
 #include "index/flat.h"
 #include "index/ivfflat.h"
+#include "index/ivfdisk.h"
+#include "index/index_maintenance.h"
+#include "index/ivfsq8.h"
 #include "index/ivfsq8.h"
 #include "index/ivfturboquant.h"
 #include "index/pq.h"
 #include "index/lsh.h"
 #include "core/utils.h"
+#include "search/filter.h"
+#include "specialized/optimizer.h"
 
 #include <math.h>
 #ifndef _WIN32
@@ -87,6 +92,38 @@ static int db_check_resource_limits(GV_Database *db, size_t additional_vectors, 
 static void db_increment_concurrent_ops(GV_Database *db);
 static void db_decrement_concurrent_ops(GV_Database *db);
 static uint64_t db_get_time_us(void);
+
+static void db_fill_ivfdisk_search_vectors(GV_Database *db, GV_SearchResult *results, int n)
+{
+    if (!db || !results || n <= 0 || db->soa_storage == NULL) return;
+    for (int i = 0; i < n; ++i) {
+        GV_Vector view;
+        memset(&view, 0, sizeof(view));
+        if (soa_storage_get_vector_view(db->soa_storage, results[i].id, &view) != 0 ||
+            view.data == NULL) {
+            continue;
+        }
+        results[i].vector = vector_create_from_data(view.dimension, view.data);
+    }
+}
+
+static int db_ivfdisk_create_index(GV_Database *db, size_t dimension, const char *filepath,
+                                   const GV_IVFDiskConfig *config)
+{
+    char data_dir[1024];
+    GV_IVFDiskConfig cfg;
+    ivfdisk_config_init(&cfg);
+    if (config) cfg = *config;
+    if (!cfg.data_dir || !*cfg.data_dir) {
+        if (!filepath || !*filepath) return -1;
+        if (snprintf(data_dir, sizeof(data_dir), "%s.ivfdisk", filepath) >= (int)sizeof(data_dir)) {
+            return -1;
+        }
+        cfg.data_dir = data_dir;
+    }
+    db->hnsw_index = ivfdisk_create(dimension, &cfg);
+    return db->hnsw_index ? 0 : -1;
+}
 
 static void db_init_common_fields(GV_Database *db) {
     db->compaction_running = 0;
@@ -229,8 +266,18 @@ static int db_wal_apply_rich(void *ctx, const float *data, size_t dimension,
             return -1;
         }
     }
+    if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        if (ivfsq8_is_trained(db->hnsw_index) == 0) {
+            return -1;
+        }
+    }
     if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         if (ivfturboquant_is_trained(db->hnsw_index) == 0) {
+            return -1;
+        }
+    }
+    if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (ivfdisk_is_trained((GV_IVFDiskIndex *)db->hnsw_index) == 0) {
             return -1;
         }
     }
@@ -245,7 +292,30 @@ static int db_wal_apply_rich(void *ctx, const float *data, size_t dimension,
     return 0;
 }
 
+static int db_wal_apply_ivfdisk_append(void *ctx, uint64_t head_id, uint64_t vector_id,
+                                       const float *data, size_t dimension)
+{
+    GV_Database *db = (GV_Database *)ctx;
+    if (!db || db->index_type != GV_INDEX_TYPE_IVFDISK || !db->hnsw_index || !data) {
+        return -1;
+    }
+    if (dimension != db->dimension) return -1;
+    if (ivfdisk_is_trained((GV_IVFDiskIndex *)db->hnsw_index) == 0) return -1;
+    return ivfdisk_insert_to_head((GV_IVFDiskIndex *)db->hnsw_index, head_id, data,
+                                  dimension, (size_t)vector_id);
+}
+
 GV_IndexType index_suggest(size_t dimension, size_t expected_count) {
+    return index_suggest_with_budget(dimension, expected_count, 0, 0);
+}
+
+size_t index_suggest_bytes_per_vector(size_t dimension, size_t metadata_bytes_per_vector) {
+    size_t meta = metadata_bytes_per_vector ? metadata_bytes_per_vector
+                                            : GV_INDEX_SUGGEST_METADATA_OVERHEAD;
+    return dimension * sizeof(float) + meta;
+}
+
+static GV_IndexType index_suggest_heuristic(size_t dimension, size_t expected_count) {
     if (expected_count <= 500) {
         return GV_INDEX_TYPE_FLAT;
     }
@@ -256,6 +326,23 @@ GV_IndexType index_suggest(size_t dimension, size_t expected_count) {
         return GV_INDEX_TYPE_IVFPQ;
     }
     return GV_INDEX_TYPE_HNSW;
+}
+
+GV_IndexType index_suggest_with_budget(size_t dimension, size_t expected_count,
+                                       size_t max_memory_bytes, size_t bytes_per_vector) {
+    if (max_memory_bytes > 0 && expected_count > 0 && dimension > 0) {
+        size_t bpv = bytes_per_vector ? bytes_per_vector
+                                      : index_suggest_bytes_per_vector(dimension, 0);
+        size_t estimated = expected_count * bpv;
+        size_t threshold = (size_t)((double)max_memory_bytes * GV_INDEX_SUGGEST_RAM_THRESHOLD_RATIO);
+        if (estimated > threshold) {
+            if (dimension >= 64 && expected_count >= 1000000) {
+                return GV_INDEX_TYPE_DISKANN;
+            }
+            return GV_INDEX_TYPE_IVFDISK;
+        }
+    }
+    return index_suggest_heuristic(dimension, expected_count);
 }
 
 static void db_normalize_vector(GV_Vector *vector) {
@@ -293,6 +380,88 @@ void db_get_stats(const GV_Database *db, GV_DBStats *out) {
     out->total_range_queries = db->total_range_queries;
     out->total_wal_records = db->total_wal_records;
     pthread_rwlock_unlock((pthread_rwlock_t *)&db->rwlock);
+}
+
+static void db_rebuild_metadata_index_from_soa(GV_Database *db) {
+    if (db == NULL || db->soa_storage == NULL) {
+        return;
+    }
+
+    GV_MetadataIndex *fresh = metadata_index_create();
+    if (fresh == NULL) {
+        return;
+    }
+
+    size_t total = db->soa_storage->count;
+    for (size_t i = 0; i < total; ++i) {
+        if (soa_storage_is_deleted(db->soa_storage, i) == 1) {
+            continue;
+        }
+        GV_Metadata *meta = db->soa_storage->metadata[i];
+        for (GV_Metadata *current = meta; current != NULL; current = current->next) {
+            if (current->key != NULL && current->value != NULL) {
+                metadata_index_add(fresh, current->key, current->value, i);
+            }
+        }
+    }
+
+    metadata_index_destroy(db->metadata_index);
+    db->metadata_index = fresh;
+}
+
+static void db_refresh_count(GV_Database *db) {
+    if (db == NULL) {
+        return;
+    }
+    if (db->index_type == GV_INDEX_TYPE_KDTREE) {
+        db->count = db->soa_storage ? soa_storage_count(db->soa_storage) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_HNSW) {
+        db->count = db->hnsw_index ? gv_hnsw_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFPQ) {
+        db->count = db->hnsw_index ? gv_ivfpq_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_FLAT) {
+        db->count = db->hnsw_index ? flat_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFFLAT) {
+        db->count = db->hnsw_index ? ivfflat_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        db->count = db->hnsw_index ? ivfsq8_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
+        db->count = db->hnsw_index ? ivfturboquant_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_PQ) {
+        db->count = db->hnsw_index ? pq_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_LSH) {
+        db->count = db->hnsw_index ? lsh_count(db->hnsw_index) : 0;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        db->count = db->soa_storage ? soa_storage_count(db->soa_storage)
+                                    : (db->hnsw_index ? ivfdisk_count((GV_IVFDiskIndex *)db->hnsw_index) : 0);
+    }
+}
+
+static int db_replay_wal(GV_Database *db) {
+    if (db == NULL || db->wal_path == NULL) {
+        return 0;
+    }
+    if (access(db->wal_path, F_OK) != 0) {
+        return 0;
+    }
+    if (db->wal == NULL) {
+        db->wal = wal_open(db->wal_path, db->dimension, (uint32_t)db->index_type);
+        if (db->wal == NULL) {
+            return -1;
+        }
+    }
+
+    db->wal_replaying = 1;
+    int rc = wal_replay_rich(db->wal_path, db->dimension, db_wal_apply_rich,
+                             db_wal_apply_delete, db_wal_apply_update,
+                             db_wal_apply_ivfdisk_append,
+                             db, (uint32_t)db->index_type);
+    db->wal_replaying = 0;
+    if (rc != 0) {
+        return -1;
+    }
+    db_refresh_count(db);
+    return 0;
 }
 
 GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_type) {
@@ -335,7 +504,8 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
     db_init_common_fields(db);
 
     if (index_type == GV_INDEX_TYPE_KDTREE || index_type == GV_INDEX_TYPE_HNSW ||
-        index_type == GV_INDEX_TYPE_FLAT || index_type == GV_INDEX_TYPE_LSH) {
+        index_type == GV_INDEX_TYPE_FLAT || index_type == GV_INDEX_TYPE_LSH ||
+        index_type == GV_INDEX_TYPE_IVFDISK) {
         db->soa_storage = soa_storage_create(dimension, 0);
         if (db->soa_storage == NULL) {
             metadata_index_destroy(db->metadata_index);
@@ -390,6 +560,18 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
     } else if (index_type == GV_INDEX_TYPE_IVFFLAT && filepath == NULL) {
         GV_IVFFlatConfig cfg = {.nlist = 64, .nprobe = 4, .train_iters = 15, .use_cosine = 0};
         db->hnsw_index = ivfflat_create(dimension, &cfg);
+        if (db->hnsw_index == NULL) {
+            pthread_rwlock_destroy(&db->rwlock);
+            pthread_mutex_destroy(&db->wal_mutex);
+            free(db);
+            return NULL;
+        }
+    } else if (index_type == GV_INDEX_TYPE_IVFSQ8 && filepath == NULL) {
+        GV_IVFSQ8Config cfg = {
+            .nlist = 64, .nprobe = 4, .train_iters = 15, .use_cosine = 0,
+            .per_dimension = 0, .default_rerank = 200
+        };
+        db->hnsw_index = ivfsq8_create(dimension, &cfg);
         if (db->hnsw_index == NULL) {
             pthread_rwlock_destroy(&db->rwlock);
             pthread_mutex_destroy(&db->wal_mutex);
@@ -478,6 +660,18 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
     }
 
     if (filepath == NULL) {
+        if (index_type == GV_INDEX_TYPE_IVFDISK) {
+            metadata_index_destroy(db->metadata_index);
+            pthread_mutex_destroy(&db->compaction_mutex);
+            pthread_cond_destroy(&db->compaction_cond);
+            pthread_mutex_destroy(&db->resource_mutex);
+            pthread_mutex_destroy(&db->observability_mutex);
+            pthread_rwlock_destroy(&db->rwlock);
+            pthread_mutex_destroy(&db->wal_mutex);
+            if (db->soa_storage) soa_storage_destroy(db->soa_storage);
+            free(db);
+            return NULL;
+        }
         if (db->wal_path != NULL) {
             db->wal = wal_open(db->wal_path, db->dimension, (uint32_t)db->index_type);
         }
@@ -506,6 +700,18 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
             } else if (index_type == GV_INDEX_TYPE_IVFFLAT) {
                 GV_IVFFlatConfig cfg = {.nlist = 64, .nprobe = 4, .train_iters = 15, .use_cosine = 0};
                 db->hnsw_index = ivfflat_create(dimension, &cfg);
+                if (db->hnsw_index == NULL) {
+                    free(db->filepath);
+                    free(db->wal_path);
+                    free(db);
+                    return NULL;
+                }
+            } else if (index_type == GV_INDEX_TYPE_IVFSQ8) {
+                GV_IVFSQ8Config cfg = {
+                    .nlist = 64, .nprobe = 4, .train_iters = 15, .use_cosine = 0,
+                    .per_dimension = 0, .default_rerank = 200
+                };
+                db->hnsw_index = ivfsq8_create(dimension, &cfg);
                 if (db->hnsw_index == NULL) {
                     free(db->filepath);
                     free(db->wal_path);
@@ -566,10 +772,27 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
                     free(db);
                     return NULL;
                 }
+            } else if (index_type == GV_INDEX_TYPE_IVFDISK) {
+                if (db_ivfdisk_create_index(db, dimension, filepath, NULL) != 0) {
+                    free(db->filepath);
+                    free(db->wal_path);
+                    if (db->soa_storage) soa_storage_destroy(db->soa_storage);
+                    free(db);
+                    return NULL;
+                }
             }
             if (db->wal_path != NULL) {
                 db->wal = wal_open(db->wal_path, db->dimension, (uint32_t)db->index_type);
                 if (db->wal == NULL) {
+                    if (db->hnsw_index) gv_hnsw_destroy(db->hnsw_index);
+                    free(db->filepath);
+                    free(db->wal_path);
+                    free(db);
+                    return NULL;
+                }
+                if (db_replay_wal(db) != 0) {
+                    wal_close(db->wal);
+                    db->wal = NULL;
                     if (db->hnsw_index) gv_hnsw_destroy(db->hnsw_index);
                     free(db->filepath);
                     free(db->wal_path);
@@ -652,9 +875,11 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
             free(db);
             return NULL;
         }
+        db_rebuild_metadata_index_from_soa(db);
     } else if (db->index_type == GV_INDEX_TYPE_HNSW) {
         void *loaded_index = NULL;
-        if (gv_hnsw_load(&loaded_index, in, db->dimension, file_version) != 0) {
+        if (gv_hnsw_load(&loaded_index, in, db->dimension, file_version,
+                         db->soa_storage) != 0) {
             fclose(in);
         if (loaded_index) gv_hnsw_destroy(loaded_index);
             if (db->hnsw_index) gv_hnsw_destroy(db->hnsw_index);
@@ -668,6 +893,7 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
         }
         db->hnsw_index = loaded_index;
         db->count = gv_hnsw_count(db->hnsw_index);
+        db_rebuild_metadata_index_from_soa(db);
     } else if (db->index_type == GV_INDEX_TYPE_IVFPQ) {
         void *loaded_index = NULL;
         if (gv_ivfpq_load(&loaded_index, in, db->dimension, file_version) != 0) {
@@ -727,6 +953,18 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
         }
         db->hnsw_index = loaded_index;
         db->count = ivfsq8_count(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        void *loaded_index = NULL;
+        if (ivfsq8_load(&loaded_index, in, db->dimension, file_version) != 0) {
+            fclose(in);
+            if (loaded_index) ivfsq8_destroy(loaded_index);
+            free(db->filepath);
+            free(db->wal_path);
+            free(db);
+            return NULL;
+        }
+        db->hnsw_index = loaded_index;
+        db->count = ivfsq8_count(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         void *loaded_index = NULL;
         if (ivfturboquant_load(&loaded_index, in, db->dimension, file_version) != 0) {
@@ -763,6 +1001,35 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
         }
         db->hnsw_index = loaded_index;
         db->count = lsh_count(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (db->soa_storage == NULL) {
+            fclose(in);
+            free(db->filepath);
+            free(db->wal_path);
+            free(db);
+            return NULL;
+        }
+        char data_dir[1024];
+        if (db->filepath == NULL ||
+            snprintf(data_dir, sizeof(data_dir), "%s.ivfdisk", db->filepath) >= (int)sizeof(data_dir)) {
+            fclose(in);
+            free(db->filepath);
+            free(db->wal_path);
+            free(db);
+            return NULL;
+        }
+        GV_IVFDiskIndex *loaded_index = NULL;
+        if (ivfdisk_load(&loaded_index, in, db->dimension, data_dir, file_version) != 0 ||
+            soa_storage_load(db->soa_storage, in, file_version) != 0) {
+            fclose(in);
+            if (loaded_index) ivfdisk_destroy(loaded_index);
+            free(db->filepath);
+            free(db->wal_path);
+            free(db);
+            return NULL;
+        }
+        db->hnsw_index = loaded_index;
+        db->count = soa_storage_count(db->soa_storage);
     } else {
         fclose(in);
         if (db->hnsw_index) gv_hnsw_destroy(db->hnsw_index);
@@ -823,12 +1090,16 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
         db->count = ivfflat_count(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
         db->count = ivfsq8_count(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        db->count = ivfsq8_count(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         db->count = ivfturboquant_count(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_PQ) {
         db->count = pq_count(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_LSH) {
         db->count = lsh_count(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        db->count = db->soa_storage ? soa_storage_count(db->soa_storage) : ivfdisk_count((GV_IVFDiskIndex *)db->hnsw_index);
     }
 
     if (db->wal_path != NULL) {
@@ -845,11 +1116,7 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
             return NULL;
         }
 
-        db->wal_replaying = 1;
-        if (wal_replay_rich(db->wal_path, db->dimension, db_wal_apply_rich,
-                            db_wal_apply_delete, db_wal_apply_update,
-                            db, (uint32_t)db->index_type) != 0) {
-            db->wal_replaying = 0;
+        if (db_replay_wal(db) != 0) {
             wal_close(db->wal);
             db->wal = NULL;
             if (db->index_type == GV_INDEX_TYPE_KDTREE) {
@@ -862,7 +1129,6 @@ GV_Database *db_open(const char *filepath, size_t dimension, GV_IndexType index_
             free(db);
             return NULL;
         }
-        db->wal_replaying = 0;
     }
     return db;
 
@@ -882,12 +1148,16 @@ load_fail:
         if (db->hnsw_index) ivfflat_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
         if (db->hnsw_index) ivfsq8_destroy(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        if (db->hnsw_index) ivfsq8_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         if (db->hnsw_index) ivfturboquant_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_PQ) {
         if (db->hnsw_index) pq_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_LSH) {
         if (db->hnsw_index) lsh_destroy(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (db->hnsw_index) ivfdisk_destroy((GV_IVFDiskIndex *)db->hnsw_index);
     }
     if (db->metadata_index) metadata_index_destroy(db->metadata_index);
     if (db->soa_storage) soa_storage_destroy(db->soa_storage);
@@ -935,12 +1205,16 @@ void db_close(GV_Database *db) {
         ivfflat_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
         ivfsq8_destroy(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        ivfsq8_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         ivfturboquant_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_PQ) {
         pq_destroy(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_LSH) {
         lsh_destroy(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        ivfdisk_destroy((GV_IVFDiskIndex *)db->hnsw_index);
     }
     if (db->soa_storage != NULL) {
         soa_storage_destroy(db->soa_storage);
@@ -968,12 +1242,17 @@ void db_close(GV_Database *db) {
     free(db);
 }
 
-GV_Database *db_open_from_memory(const void *data, size_t size,
-                                    size_t dimension, GV_IndexType index_type) {
+static GV_Database *db_open_from_memory_impl(const void *data, size_t size,
+                                                size_t dimension, GV_IndexType index_type,
+                                                const char *ivfdisk_data_dir) {
     if (data == NULL || size == 0) {
         return NULL;
     }
     if (dimension == 0) {
+        return NULL;
+    }
+    if (index_type == GV_INDEX_TYPE_IVFDISK &&
+        (ivfdisk_data_dir == NULL || ivfdisk_data_dir[0] == '\0')) {
         return NULL;
     }
 
@@ -1012,7 +1291,8 @@ GV_Database *db_open_from_memory(const void *data, size_t size,
     db_init_common_fields(db);
 
     if (index_type == GV_INDEX_TYPE_KDTREE || index_type == GV_INDEX_TYPE_HNSW ||
-        index_type == GV_INDEX_TYPE_FLAT || index_type == GV_INDEX_TYPE_LSH) {
+        index_type == GV_INDEX_TYPE_FLAT || index_type == GV_INDEX_TYPE_LSH ||
+        index_type == GV_INDEX_TYPE_IVFDISK) {
         db->soa_storage = soa_storage_create(dimension, 0);
         if (db->soa_storage == NULL) {
             metadata_index_destroy(db->metadata_index);
@@ -1093,9 +1373,11 @@ GV_Database *db_open_from_memory(const void *data, size_t size,
             free(db);
             return NULL;
         }
+        db_rebuild_metadata_index_from_soa(db);
     } else if (db->index_type == GV_INDEX_TYPE_HNSW) {
         void *loaded_index = NULL;
-        if (gv_hnsw_load(&loaded_index, in, db->dimension, file_version) != 0) {
+        if (gv_hnsw_load(&loaded_index, in, db->dimension, file_version,
+                         db->soa_storage) != 0) {
             fclose(in);
         if (loaded_index) gv_hnsw_destroy(loaded_index);
             pthread_rwlock_destroy(&db->rwlock);
@@ -1105,6 +1387,7 @@ GV_Database *db_open_from_memory(const void *data, size_t size,
         }
         db->hnsw_index = loaded_index;
         db->count = gv_hnsw_count(db->hnsw_index);
+        db_rebuild_metadata_index_from_soa(db);
     } else if (db->index_type == GV_INDEX_TYPE_IVFPQ) {
         void *loaded_index = NULL;
         if (gv_ivfpq_load(&loaded_index, in, db->dimension, file_version) != 0) {
@@ -1200,6 +1483,26 @@ GV_Database *db_open_from_memory(const void *data, size_t size,
         }
         db->hnsw_index = loaded_index;
         db->count = lsh_count(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (db->soa_storage == NULL) {
+            fclose(in);
+            pthread_rwlock_destroy(&db->rwlock);
+            pthread_mutex_destroy(&db->wal_mutex);
+            free(db);
+            return NULL;
+        }
+        GV_IVFDiskIndex *loaded_index = NULL;
+        if (ivfdisk_load(&loaded_index, in, db->dimension, ivfdisk_data_dir, file_version) != 0 ||
+            soa_storage_load(db->soa_storage, in, file_version) != 0) {
+            fclose(in);
+            if (loaded_index) ivfdisk_destroy(loaded_index);
+            pthread_rwlock_destroy(&db->rwlock);
+            pthread_mutex_destroy(&db->wal_mutex);
+            free(db);
+            return NULL;
+        }
+        db->hnsw_index = loaded_index;
+        db->count = soa_storage_count(db->soa_storage);
     } else {
         fclose(in);
         pthread_rwlock_destroy(&db->rwlock);
@@ -1340,15 +1643,40 @@ GV_Database *db_open_from_memory(const void *data, size_t size,
         db->count = pq_count(db->hnsw_index);
     } else if (db->index_type == GV_INDEX_TYPE_LSH) {
         db->count = lsh_count(db->hnsw_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        db->count = soa_storage_count(db->soa_storage);
     }
 
     /* WAL is intentionally disabled for memory-backed snapshots. */
     return db;
 }
 
+GV_Database *db_open_from_memory(const void *data, size_t size,
+                                    size_t dimension, GV_IndexType index_type) {
+    if (index_type == GV_INDEX_TYPE_IVFDISK) {
+        return NULL;
+    }
+    return db_open_from_memory_impl(data, size, dimension, index_type, NULL);
+}
+
+GV_Database *db_open_from_memory_ivfdisk(const void *data, size_t size,
+                                            size_t dimension,
+                                            const char *ivfdisk_data_dir) {
+    return db_open_from_memory_impl(data, size, dimension,
+                                    GV_INDEX_TYPE_IVFDISK, ivfdisk_data_dir);
+}
+
 GV_Database *db_open_mmap(const char *filepath, size_t dimension, GV_IndexType index_type) {
     if (filepath == NULL) {
         return NULL;
+    }
+    char ivfdisk_dir[1024];
+    const char *ivfdisk_data_dir = NULL;
+    if (index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (snprintf(ivfdisk_dir, sizeof(ivfdisk_dir), "%s.ivfdisk", filepath) >= (int)sizeof(ivfdisk_dir)) {
+            return NULL;
+        }
+        ivfdisk_data_dir = ivfdisk_dir;
     }
     GV_MMap *mm = mmap_open_readonly(filepath);
     if (mm == NULL) {
@@ -1361,7 +1689,12 @@ GV_Database *db_open_mmap(const char *filepath, size_t dimension, GV_IndexType i
         return NULL;
     }
 
-    GV_Database *db = db_open_from_memory(data, size, dimension, index_type);
+    GV_Database *db = NULL;
+    if (index_type == GV_INDEX_TYPE_IVFDISK) {
+        db = db_open_from_memory_ivfdisk(data, size, dimension, ivfdisk_data_dir);
+    } else {
+        db = db_open_from_memory(data, size, dimension, index_type);
+    }
     if (db == NULL) {
         mmap_close(mm);
         return NULL;
@@ -1610,6 +1943,73 @@ GV_Database *db_open_with_ivfflat_config(const char *filepath, size_t dimension,
     return db;
 }
 
+GV_Database *db_open_with_ivfdisk_config(const char *filepath, size_t dimension,
+                                             GV_IndexType index_type, const GV_IVFDiskConfig *config) {
+    if (index_type != GV_INDEX_TYPE_IVFDISK) {
+        return db_open(filepath, dimension, index_type);
+    }
+    if (dimension == 0 || filepath == NULL || !*filepath) {
+        return NULL;
+    }
+
+    GV_Database *db = (GV_Database *)malloc(sizeof(GV_Database));
+    if (db == NULL) {
+        return NULL;
+    }
+
+    db->dimension = dimension;
+    db->index_type = index_type;
+    db->root = NULL;
+    db->hnsw_index = NULL;
+    db->sparse_index = NULL;
+    db->soa_storage = soa_storage_create(dimension, 0);
+    db->filepath = gv_dup_cstr(filepath);
+    db->wal_path = NULL;
+    db->wal = NULL;
+    db->wal_replaying = 0;
+    pthread_rwlock_init(&db->rwlock, NULL);
+    pthread_mutex_init(&db->wal_mutex, NULL);
+    db->count = 0;
+    db->exact_search_threshold = 1000;
+    db->force_exact_search = 0;
+    db->total_inserts = 0;
+    db->total_queries = 0;
+    db->total_range_queries = 0;
+    db->total_wal_records = 0;
+    db->cosine_normalized = 0;
+    db->metadata_index = metadata_index_create();
+    if (db->metadata_index == NULL || db->soa_storage == NULL || db->filepath == NULL) {
+        if (db->soa_storage) soa_storage_destroy(db->soa_storage);
+        if (db->metadata_index) metadata_index_destroy(db->metadata_index);
+        free(db->filepath);
+        pthread_rwlock_destroy(&db->rwlock);
+        pthread_mutex_destroy(&db->wal_mutex);
+        free(db);
+        return NULL;
+    }
+    db_init_common_fields(db);
+
+    db->wal_path = db_build_wal_path(filepath);
+    if (db->wal_path == NULL ||
+        db_ivfdisk_create_index(db, dimension, filepath, config) != 0) {
+        metadata_index_destroy(db->metadata_index);
+        soa_storage_destroy(db->soa_storage);
+        free(db->filepath);
+        free(db->wal_path);
+        pthread_mutex_destroy(&db->resource_mutex);
+        pthread_mutex_destroy(&db->observability_mutex);
+        pthread_cond_destroy(&db->compaction_cond);
+        pthread_mutex_destroy(&db->compaction_mutex);
+        pthread_rwlock_destroy(&db->rwlock);
+        pthread_mutex_destroy(&db->wal_mutex);
+        free(db);
+        return NULL;
+    }
+
+    db->wal = wal_open(db->wal_path, db->dimension, (uint32_t)db->index_type);
+    return db;
+}
+
 GV_Database *db_open_with_ivfsq8_config(const char *filepath, size_t dimension,
                                         GV_IndexType index_type, const GV_IVFSQ8Config *config) {
     if (index_type != GV_INDEX_TYPE_IVFSQ8) {
@@ -1777,6 +2177,87 @@ GV_Database *db_open_with_ivfturboquant_config(const char *filepath, size_t dime
         pthread_mutex_destroy(&db->wal_mutex);
         free(db->filepath);
         free(db->wal_path);
+        free(db);
+        return NULL;
+    }
+
+    return db;
+}
+
+GV_Database *db_open_with_ivfsq8_config(const char *filepath, size_t dimension,
+                                        GV_IndexType index_type, const GV_IVFSQ8Config *config) {
+    if (index_type != GV_INDEX_TYPE_IVFSQ8) {
+        return db_open(filepath, dimension, index_type);
+    }
+    if (dimension == 0) {
+        return NULL;
+    }
+
+    GV_Database *db = (GV_Database *)malloc(sizeof(GV_Database));
+    if (db == NULL) {
+        return NULL;
+    }
+
+    db->dimension = dimension;
+    db->index_type = index_type;
+    db->root = NULL;
+    db->hnsw_index = NULL;
+    db->sparse_index = NULL;
+    db->soa_storage = NULL;
+    db->filepath = NULL;
+    db->wal_path = NULL;
+    if (filepath != NULL) {
+        db->filepath = gv_dup_cstr(filepath);
+        if (db->filepath == NULL) {
+            free(db);
+            return NULL;
+        }
+        db->wal_path = db_build_wal_path(filepath);
+        if (db->wal_path == NULL) {
+            free(db->filepath);
+            free(db);
+            return NULL;
+        }
+    }
+    db->wal = NULL;
+    db->wal_replaying = 0;
+    pthread_rwlock_init(&db->rwlock, NULL);
+    pthread_mutex_init(&db->wal_mutex, NULL);
+    db->count = 0;
+    db->exact_search_threshold = 1000;
+    db->force_exact_search = 0;
+    db->total_inserts = 0;
+    db->total_queries = 0;
+    db->total_range_queries = 0;
+    db->total_wal_records = 0;
+    db->cosine_normalized = 0;
+    db->metadata_index = metadata_index_create();
+    if (db->metadata_index == NULL) {
+        pthread_rwlock_destroy(&db->rwlock);
+        pthread_mutex_destroy(&db->wal_mutex);
+        free(db);
+        return NULL;
+    }
+    db_init_common_fields(db);
+
+    if (config != NULL) {
+        db->hnsw_index = ivfsq8_create(dimension, config);
+    } else {
+        GV_IVFSQ8Config default_cfg = {
+            .nlist = 64, .nprobe = 4, .train_iters = 15, .use_cosine = 0,
+            .per_dimension = 0, .default_rerank = 200
+        };
+        db->hnsw_index = ivfsq8_create(dimension, &default_cfg);
+    }
+
+    if (db->hnsw_index == NULL) {
+        metadata_index_destroy(db->metadata_index);
+        pthread_mutex_destroy(&db->resource_mutex);
+        pthread_mutex_destroy(&db->observability_mutex);
+        pthread_cond_destroy(&db->compaction_cond);
+        pthread_mutex_destroy(&db->compaction_mutex);
+        pthread_rwlock_destroy(&db->rwlock);
+        pthread_mutex_destroy(&db->wal_mutex);
         free(db);
         return NULL;
     }
@@ -2002,6 +2483,34 @@ int db_wal_dump(const GV_Database *db, FILE *out) {
     return wal_dump(db->wal_path, db->dimension, (uint32_t)db->index_type, out);
 }
 
+const char *db_wal_path(const GV_Database *db) {
+    if (!db) return NULL;
+    return db->wal_path;
+}
+
+int db_apply_wal_record(GV_Database *db, const uint8_t *record, size_t len) {
+    if (!db || !record || len == 0) return -1;
+
+    int has_crc = 1;
+    (void)has_crc;
+
+    db->wal_replaying = 1;
+    int rc = wal_apply_record_buffer(record, len, has_crc, db->dimension,
+                                     db_wal_apply_rich, db_wal_apply_delete,
+                                     db_wal_apply_update, db_wal_apply_ivfdisk_append,
+                                     db);
+    db->wal_replaying = 0;
+    if (rc != 0) return rc;
+
+    if (db->wal != NULL) {
+        pthread_mutex_lock(&db->wal_mutex);
+        rc = wal_append_raw(db->wal, record, len);
+        pthread_mutex_unlock(&db->wal_mutex);
+        if (rc == 0) db->total_wal_records += 1;
+    }
+    return rc;
+}
+
 int db_add_vector(GV_Database *db, const float *data, size_t dimension) {
     if (db == NULL || data == NULL || dimension == 0 || dimension != db->dimension) {
         return -1;
@@ -2061,6 +2570,14 @@ int db_add_vector(GV_Database *db, const float *data, size_t dimension) {
             return -1;
         }
         status = kdtree_insert(&(db->root), db->soa_storage, vector_index, 0);
+        if (status == 0 && metadata_count > 0 && db->metadata_index != NULL) {
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
+        }
     } else if (db->index_type == GV_INDEX_TYPE_HNSW) {
         GV_Vector *vector = vector_create_from_data(dimension, data);
         if (vector == NULL) {
@@ -2071,6 +2588,15 @@ int db_add_vector(GV_Database *db, const float *data, size_t dimension) {
             db_normalize_vector(vector);
         }
         status = gv_hnsw_insert(db->hnsw_index, vector);
+        if (status == 0 && metadata_count > 0 && db->metadata_index != NULL) {
+            size_t vector_index = db->count;
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
+        }
         if (status != 0) {
             vector_destroy(vector);
         }
@@ -2110,6 +2636,72 @@ int db_add_vector(GV_Database *db, const float *data, size_t dimension) {
             db_normalize_vector(vector);
         }
         status = ivfflat_insert(db->hnsw_index, vector);
+        if (status != 0) {
+            vector_destroy(vector);
+        }
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (ivfdisk_is_trained((GV_IVFDiskIndex *)db->hnsw_index) == 0) {
+            pthread_rwlock_unlock(&db->rwlock);
+            db_decrement_concurrent_ops(db);
+            return -1;
+        }
+        float *normalized_data = (float *)malloc(dimension * sizeof(float));
+        if (normalized_data == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            db_decrement_concurrent_ops(db);
+            return -1;
+        }
+        memcpy(normalized_data, data, dimension * sizeof(float));
+        if (db->cosine_normalized) {
+            float norm_sq = 0.0f;
+            for (size_t i = 0; i < dimension; ++i) {
+                float v = normalized_data[i];
+                norm_sq += v * v;
+            }
+            if (norm_sq > 0.0f) {
+                float inv = 1.0f / sqrtf(norm_sq);
+                for (size_t i = 0; i < dimension; ++i) {
+                    normalized_data[i] *= inv;
+                }
+            }
+        }
+        size_t vector_index = soa_storage_add(db->soa_storage, normalized_data, NULL);
+        free(normalized_data);
+        if (vector_index == (size_t)-1) {
+            pthread_rwlock_unlock(&db->rwlock);
+            db_decrement_concurrent_ops(db);
+            return -1;
+        }
+        const float *stored = soa_storage_get_data(db->soa_storage, vector_index);
+        if (db->wal_replaying) {
+            status = 0;
+        } else {
+            uint64_t heads[2];
+            size_t nh = 0;
+            status = ivfdisk_insert_routed((GV_IVFDiskIndex *)db->hnsw_index, stored,
+                                           dimension, vector_index, heads, &nh, 2);
+            if (status == 0 && db->wal != NULL) {
+                pthread_mutex_lock(&db->wal_mutex);
+                for (size_t hi = 0; hi < nh; ++hi) {
+                    if (wal_append_ivfdisk_append(db->wal, heads[hi], (uint64_t)vector_index,
+                                                  stored, dimension) != 0) {
+                        status = -1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&db->wal_mutex);
+            }
+        }
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        GV_Vector *vector = vector_create_from_data(dimension, data);
+        if (vector == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        if (db->cosine_normalized) {
+            db_normalize_vector(vector);
+        }
+        status = ivfsq8_insert(db->hnsw_index, vector);
         if (status != 0) {
             vector_destroy(vector);
         }
@@ -2339,6 +2931,8 @@ int db_add_vector_with_metadata(GV_Database *db, const float *data, size_t dimen
     } else if (db->index_type == GV_INDEX_TYPE_FLAT ||
                db->index_type == GV_INDEX_TYPE_IVFFLAT ||
          db->index_type == GV_INDEX_TYPE_IVFSQ8 ||
+               db->index_type == GV_INDEX_TYPE_IVFSQ8 ||
+         db->index_type == GV_INDEX_TYPE_IVFSQ8 ||
          db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT ||
                db->index_type == GV_INDEX_TYPE_PQ ||
                db->index_type == GV_INDEX_TYPE_LSH) {
@@ -2364,6 +2958,8 @@ int db_add_vector_with_metadata(GV_Database *db, const float *data, size_t dimen
             status = flat_insert(db->hnsw_index, vector);
         } else if (db->index_type == GV_INDEX_TYPE_IVFFLAT) {
             status = ivfflat_insert(db->hnsw_index, vector);
+        } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+            status = ivfsq8_insert(db->hnsw_index, vector);
         } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
             status = ivfsq8_insert(db->hnsw_index, vector);
         } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
@@ -2524,6 +3120,14 @@ int db_add_vector_with_rich_metadata(GV_Database *db, const float *data, size_t 
             return -1;
         }
         status = kdtree_insert(&(db->root), db->soa_storage, vector_index, 0);
+        if (status == 0 && metadata_count > 0 && db->metadata_index != NULL) {
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
+        }
     } else if (db->index_type == GV_INDEX_TYPE_HNSW) {
         GV_Vector *vector = vector_create_from_data(dimension, data);
         if (vector == NULL) {
@@ -2543,6 +3147,15 @@ int db_add_vector_with_rich_metadata(GV_Database *db, const float *data, size_t 
             }
         }
         status = gv_hnsw_insert(db->hnsw_index, vector);
+        if (status == 0 && metadata_count > 0 && db->metadata_index != NULL) {
+            size_t vector_index = db->count;
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
+        }
         if (status != 0) {
             vector_destroy(vector);
         }
@@ -2565,8 +3178,100 @@ int db_add_vector_with_rich_metadata(GV_Database *db, const float *data, size_t 
             }
         }
         status = gv_ivfpq_insert(db->hnsw_index, vector);
+        if (status == 0 && metadata_count > 0 && db->metadata_index != NULL) {
+            size_t vector_index = db->count;
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
+        }
         if (status != 0) {
             vector_destroy(vector);
+        }
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (ivfdisk_is_trained((GV_IVFDiskIndex *)db->hnsw_index) == 0) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        float *normalized_data = (float *)malloc(dimension * sizeof(float));
+        if (normalized_data == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        memcpy(normalized_data, data, dimension * sizeof(float));
+        if (db->cosine_normalized) {
+            float norm_sq = 0.0f;
+            for (size_t i = 0; i < dimension; ++i) {
+                float v = normalized_data[i];
+                norm_sq += v * v;
+            }
+            if (norm_sq > 0.0f) {
+                float inv = 1.0f / sqrtf(norm_sq);
+                for (size_t i = 0; i < dimension; ++i) {
+                    normalized_data[i] *= inv;
+                }
+            }
+        }
+        GV_Metadata *metadata = NULL;
+        if (metadata_count > 0) {
+            GV_Vector temp_vec;
+            temp_vec.dimension = dimension;
+            temp_vec.data = NULL;
+            temp_vec.metadata = NULL;
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    if (vector_set_metadata(&temp_vec, metadata_keys[i], metadata_values[i]) != 0) {
+                        vector_clear_metadata(&temp_vec);
+                        free(normalized_data);
+                        pthread_rwlock_unlock(&db->rwlock);
+                        return -1;
+                    }
+                }
+            }
+            metadata = temp_vec.metadata;
+        }
+        size_t vector_index = soa_storage_add(db->soa_storage, normalized_data, metadata);
+        free(normalized_data);
+        if (vector_index == (size_t)-1) {
+            if (metadata != NULL) {
+                GV_Vector temp_vec;
+                temp_vec.dimension = dimension;
+                temp_vec.data = NULL;
+                temp_vec.metadata = metadata;
+                vector_clear_metadata(&temp_vec);
+            }
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        if (metadata_count > 0 && db->metadata_index != NULL) {
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
+        }
+        const float *stored = soa_storage_get_data(db->soa_storage, vector_index);
+        if (db->wal_replaying) {
+            status = 0;
+        } else {
+            uint64_t heads[2];
+            size_t nh = 0;
+            status = ivfdisk_insert_routed((GV_IVFDiskIndex *)db->hnsw_index, stored,
+                                           dimension, vector_index, heads, &nh, 2);
+            if (status == 0 && db->wal != NULL) {
+                pthread_mutex_lock(&db->wal_mutex);
+                for (size_t hi = 0; hi < nh; ++hi) {
+                    if (wal_append_ivfdisk_append(db->wal, heads[hi], (uint64_t)vector_index,
+                                                  stored, dimension) != 0) {
+                        status = -1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&db->wal_mutex);
+            }
         }
     } else if (db->index_type == GV_INDEX_TYPE_FLAT ||
                db->index_type == GV_INDEX_TYPE_IVFFLAT ||
@@ -2603,6 +3308,15 @@ int db_add_vector_with_rich_metadata(GV_Database *db, const float *data, size_t 
             status = pq_insert(db->hnsw_index, vector);
         } else {
             status = lsh_insert(db->hnsw_index, vector);
+        }
+        if (status == 0 && metadata_count > 0 && db->metadata_index != NULL) {
+            size_t vector_index = db->count;
+            for (size_t i = 0; i < metadata_count; i++) {
+                if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
+                    metadata_index_add(db->metadata_index, metadata_keys[i],
+                                       metadata_values[i], vector_index);
+                }
+            }
         }
         if (status != 0) {
             vector_destroy(vector);
@@ -2646,6 +3360,16 @@ int db_ivfflat_train(GV_Database *db, const float *data, size_t count, size_t di
         return -1;
     }
     return ivfflat_train(db->hnsw_index, data, count);
+}
+
+int db_ivfdisk_train(GV_Database *db, const float *data, size_t count, size_t dimension) {
+    if (db == NULL || data == NULL || count == 0 || dimension != db->dimension) {
+        return -1;
+    }
+    if (db->index_type != GV_INDEX_TYPE_IVFDISK || db->hnsw_index == NULL) {
+        return -1;
+    }
+    return ivfdisk_train((GV_IVFDiskIndex *)db->hnsw_index, data, count);
 }
 
 int db_ivfsq8_train(GV_Database *db, const float *data, size_t count, size_t dimension) {
@@ -2777,12 +3501,23 @@ int db_save(const GV_Database *db, const char *filepath) {
             status = ivfflat_save(db->hnsw_index, out, version);
         } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
             status = ivfsq8_save(db->hnsw_index, out, version);
+        } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+            status = ivfsq8_save(db->hnsw_index, out, version);
         } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
             status = ivfturboquant_save(db->hnsw_index, out, version);
         } else if (db->index_type == GV_INDEX_TYPE_PQ) {
             status = pq_save(db->hnsw_index, out, version);
         } else if (db->index_type == GV_INDEX_TYPE_LSH) {
             status = lsh_save(db->hnsw_index, out, version);
+        } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+            if (db->hnsw_index == NULL || db->soa_storage == NULL) {
+                status = -1;
+            } else {
+                status = ivfdisk_save((const GV_IVFDiskIndex *)db->hnsw_index, out, version);
+                if (status == 0) {
+                    status = soa_storage_save(db->soa_storage, out, version);
+                }
+            }
         } else {
             status = -1;
         }
@@ -2927,6 +3662,11 @@ int db_search(const GV_Database *db, const float *query_data, size_t k,
         r = flat_search(db->hnsw_index, &query_vec, k, results, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFFLAT) {
         r = ivfflat_search(db->hnsw_index, &query_vec, k, results, distance_type, NULL, NULL);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        r = ivfdisk_search((GV_IVFDiskIndex *)db->hnsw_index, query_data, k, results, distance_type);
+        if (r > 0) db_fill_ivfdisk_search_vectors((GV_Database *)db, results, r);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        r = ivfsq8_search(db->hnsw_index, &query_vec, k, results, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
         r = ivfsq8_search(db->hnsw_index, &query_vec, k, results, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
@@ -3010,6 +3750,8 @@ int db_search_batch(const GV_Database *db, const float *queries, size_t qcount, 
             r = flat_search(db->hnsw_index, &qv, k, slot, distance_type, NULL, NULL);
         } else if (db->index_type == GV_INDEX_TYPE_IVFFLAT) {
             r = ivfflat_search(db->hnsw_index, &qv, k, slot, distance_type, NULL, NULL);
+        } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+            r = ivfsq8_search(db->hnsw_index, &qv, k, slot, distance_type, NULL, NULL);
         } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
             r = ivfsq8_search(db->hnsw_index, &qv, k, slot, distance_type, NULL, NULL);
         } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
@@ -3103,6 +3845,11 @@ int db_search_filtered(const GV_Database *db, const float *query_data, size_t k,
                               filter_key, filter_value);
         pthread_rwlock_unlock((pthread_rwlock_t *)&db->rwlock);
         return r;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        int r = ivfsq8_search(db->hnsw_index, &query_vec, k, results, distance_type,
+                              filter_key, filter_value);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&db->rwlock);
+        return r;
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         int r = ivfturboquant_search(db->hnsw_index, &query_vec, k, results, distance_type,
                                      filter_key, filter_value);
@@ -3150,6 +3897,72 @@ int db_search_filtered(const GV_Database *db, const float *query_data, size_t k,
     return -1;
 }
 
+static double db_estimate_filter_selectivity(const GV_Database *db, const char *filter_expr) {
+    if (!db || !filter_expr || db->count == 0 || !db->metadata_index) {
+        return 1.0;
+    }
+
+    const char *p = filter_expr;
+    while (*p == ' ' || *p == '\t') {
+        ++p;
+    }
+
+    char key[128];
+    char val[256];
+    if (sscanf(p, "%127[^ =] == \"%255[^\"]\"", key, val) == 2) {
+        size_t matches = metadata_index_count(db->metadata_index, key, val);
+        if (matches > 0) {
+            double sel = (double)matches / (double)db->count;
+            return sel < 1.0 ? sel : 1.0;
+        }
+        return 0.01;
+    }
+
+    return 0.05;
+}
+
+static size_t db_filter_search_candidates(const GV_Database *db, size_t k,
+                                          const char *filter_expr) {
+    if (!db || k == 0) {
+        return k;
+    }
+
+    double selectivity = db_estimate_filter_selectivity(db, filter_expr);
+    size_t max_candidates = k * 4;
+    GV_QueryOptimizer *opt = optimizer_create();
+    if (opt) {
+        GV_CollectionStats stats;
+        memset(&stats, 0, sizeof(stats));
+        stats.total_vectors = db->count;
+        stats.dimension = db->dimension;
+        stats.index_type = (int)db->index_type;
+        if (selectivity > 0.0) {
+            stats.avg_vectors_per_filter_match = db->count * selectivity;
+        }
+        optimizer_update_stats(opt, &stats);
+
+        GV_QueryPlan plan;
+        if (optimizer_plan(opt, k, 1, selectivity, &plan) == 0) {
+            if (plan.strategy == GV_PLAN_EXACT_SCAN) {
+                max_candidates = db->count;
+            } else if (plan.strategy == GV_PLAN_OVERSAMPLE_FILTER && plan.oversample_k > 0) {
+                max_candidates = plan.oversample_k;
+            } else if (plan.oversample_k > 0) {
+                max_candidates = plan.oversample_k;
+            }
+        }
+        optimizer_destroy(opt);
+    }
+
+    if (max_candidates < k) {
+        max_candidates = k;
+    }
+    if (max_candidates > db->count) {
+        max_candidates = db->count;
+    }
+    return max_candidates;
+}
+
 int db_search_with_filter_expr(const GV_Database *db, const float *query_data, size_t k,
                                   GV_SearchResult *results, GV_DistanceType distance_type,
                                   const char *filter_expr) {
@@ -3191,13 +4004,7 @@ int db_search_with_filter_expr(const GV_Database *db, const float *query_data, s
         return 0;
     }
 
-    size_t max_candidates = k * 4;
-    if (max_candidates < k) {
-        max_candidates = k;
-    }
-    if (max_candidates > db->count) {
-        max_candidates = db->count;
-    }
+    size_t max_candidates = db_filter_search_candidates(db, k, filter_expr);
     if (max_candidates == 0) {
         pthread_rwlock_unlock((pthread_rwlock_t *)&db->rwlock);
         filter_destroy(filter);
@@ -3231,6 +4038,8 @@ int db_search_with_filter_expr(const GV_Database *db, const float *query_data, s
         n = flat_search(db->hnsw_index, &query_vec, max_candidates, tmp, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFFLAT) {
         n = ivfflat_search(db->hnsw_index, &query_vec, max_candidates, tmp, distance_type, NULL, NULL);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        n = ivfsq8_search(db->hnsw_index, &query_vec, max_candidates, tmp, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
         n = ivfsq8_search(db->hnsw_index, &query_vec, max_candidates, tmp, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
@@ -3360,6 +4169,8 @@ int db_range_search(const GV_Database *db, const float *query_data, float radius
         r = ivfflat_range_search(db->hnsw_index, &query_vec, radius, results, max_results, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
         r = ivfsq8_range_search(db->hnsw_index, &query_vec, radius, results, max_results, distance_type, NULL, NULL);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        r = ivfsq8_range_search(db->hnsw_index, &query_vec, radius, results, max_results, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         r = ivfturboquant_range_search(db->hnsw_index, &query_vec, radius, results, max_results, distance_type, NULL, NULL);
     } else if (db->index_type == GV_INDEX_TYPE_PQ) {
@@ -3441,6 +4252,11 @@ int db_range_search_filtered(const GV_Database *db, const float *query_data, flo
                                 distance_type, filter_key, filter_value);
         pthread_rwlock_unlock((pthread_rwlock_t *)&db->rwlock);
         return r;
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        r = ivfsq8_range_search(db->hnsw_index, &query_vec, radius, results, max_results,
+                                distance_type, filter_key, filter_value);
+        pthread_rwlock_unlock((pthread_rwlock_t *)&db->rwlock);
+        return r;
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         r = ivfturboquant_range_search(db->hnsw_index, &query_vec, radius, results, max_results,
                                        distance_type, filter_key, filter_value);
@@ -3499,7 +4315,7 @@ int db_delete_vector_by_index(GV_Database *db, size_t vector_index) {
             pthread_rwlock_unlock(&db->rwlock);
             return -1;
         }
-        status = gv_hnsw_delete(db->hnsw_index, vector_index);
+        status = gv_hnsw_delete_by_vector_index(db->hnsw_index, vector_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFPQ) {
         if (db->hnsw_index == NULL) {
             pthread_rwlock_unlock(&db->rwlock);
@@ -3530,6 +4346,12 @@ int db_delete_vector_by_index(GV_Database *db, size_t vector_index) {
             return -1;
         }
         status = ivfsq8_delete(db->hnsw_index, vector_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        if (db->hnsw_index == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        status = ivfsq8_delete(db->hnsw_index, vector_index);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         if (db->hnsw_index == NULL) {
             pthread_rwlock_unlock(&db->rwlock);
@@ -3548,6 +4370,21 @@ int db_delete_vector_by_index(GV_Database *db, size_t vector_index) {
             return -1;
         }
         status = lsh_delete(db->hnsw_index, vector_index);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (db->hnsw_index == NULL || db->soa_storage == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        if (vector_index >= db->soa_storage->count ||
+            soa_storage_is_deleted(db->soa_storage, vector_index) == 1) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        const float *stored = soa_storage_get_data(db->soa_storage, vector_index);
+        status = ivfdisk_delete((GV_IVFDiskIndex *)db->hnsw_index, vector_index, stored);
+        if (status == 0) {
+            status = soa_storage_mark_deleted(db->soa_storage, vector_index);
+        }
     } else {
         pthread_rwlock_unlock(&db->rwlock);
         return -1;
@@ -3624,6 +4461,12 @@ int db_update_vector(GV_Database *db, size_t vector_index, const float *new_data
             return -1;
         }
         status = ivfsq8_update(db->hnsw_index, vector_index, new_data, dimension);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFSQ8) {
+        if (db->hnsw_index == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        status = ivfsq8_update(db->hnsw_index, vector_index, new_data, dimension);
     } else if (db->index_type == GV_INDEX_TYPE_IVFTURBOQUANT) {
         if (db->hnsw_index == NULL) {
             pthread_rwlock_unlock(&db->rwlock);
@@ -3642,6 +4485,21 @@ int db_update_vector(GV_Database *db, size_t vector_index, const float *new_data
             return -1;
         }
         status = lsh_update(db->hnsw_index, vector_index, new_data, dimension);
+    } else if (db->index_type == GV_INDEX_TYPE_IVFDISK) {
+        if (db->hnsw_index == NULL || db->soa_storage == NULL) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        if (vector_index >= db->soa_storage->count ||
+            soa_storage_is_deleted(db->soa_storage, vector_index) == 1) {
+            pthread_rwlock_unlock(&db->rwlock);
+            return -1;
+        }
+        status = soa_storage_update_data(db->soa_storage, vector_index, new_data);
+        if (status == 0) {
+            status = ivfdisk_update((GV_IVFDiskIndex *)db->hnsw_index, vector_index,
+                                    new_data, dimension);
+        }
     } else if (db->index_type == GV_INDEX_TYPE_SPARSE) {
         pthread_rwlock_unlock(&db->rwlock);
         return -1;
@@ -3689,11 +4547,22 @@ int db_update_vector_metadata(GV_Database *db, size_t vector_index,
             return -1;
         }
         
-        /* Create new metadata chain by building a temporary vector */
+        /* Merge: start from existing metadata, overlay updated keys */
         GV_Vector temp_vec;
         temp_vec.dimension = db->dimension;
         temp_vec.data = NULL;
         temp_vec.metadata = NULL;
+
+        GV_Metadata *old_metadata = soa_storage_get_metadata(db->soa_storage, vector_index);
+        for (GV_Metadata *cur = old_metadata; cur != NULL; cur = cur->next) {
+            if (cur->key != NULL && cur->value != NULL) {
+                if (vector_set_metadata(&temp_vec, cur->key, cur->value) != 0) {
+                    vector_clear_metadata(&temp_vec);
+                    pthread_rwlock_unlock(&db->rwlock);
+                    return -1;
+                }
+            }
+        }
         
         for (size_t i = 0; i < metadata_count; ++i) {
             if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
@@ -3705,8 +4574,7 @@ int db_update_vector_metadata(GV_Database *db, size_t vector_index,
             }
         }
         
-        /* Get old metadata and copy keys/values before updating (update will free old metadata) */
-        GV_Metadata *old_metadata = soa_storage_get_metadata(db->soa_storage, vector_index);
+        /* Copy old metadata for inverted-index diff before update */
         GV_Metadata *old_metadata_copy = NULL;
         if (old_metadata != NULL && db->metadata_index != NULL) {
             /* Copy old metadata chain to avoid use-after-free */
@@ -3745,7 +4613,8 @@ int db_update_vector_metadata(GV_Database *db, size_t vector_index,
         temp_vec.metadata = NULL;
 
         if (status == 0 && db->metadata_index != NULL) {
-            metadata_index_update(db->metadata_index, vector_index, old_metadata_copy, temp_vec.metadata);
+            GV_Metadata *new_metadata = soa_storage_get_metadata(db->soa_storage, vector_index);
+            metadata_index_update(db->metadata_index, vector_index, old_metadata_copy, new_metadata);
         }
         
         while (old_metadata_copy != NULL) {
@@ -3779,6 +4648,17 @@ int db_update_vector_metadata(GV_Database *db, size_t vector_index,
         temp_vec.data = NULL;
         temp_vec.metadata = NULL;
 
+        GV_Metadata *old_metadata = soa_storage_get_metadata(db->soa_storage, vector_index);
+        for (GV_Metadata *cur = old_metadata; cur != NULL; cur = cur->next) {
+            if (cur->key != NULL && cur->value != NULL) {
+                if (vector_set_metadata(&temp_vec, cur->key, cur->value) != 0) {
+                    vector_clear_metadata(&temp_vec);
+                    pthread_rwlock_unlock(&db->rwlock);
+                    return -1;
+                }
+            }
+        }
+
         for (size_t i = 0; i < metadata_count; ++i) {
             if (metadata_keys[i] != NULL && metadata_values[i] != NULL) {
                 if (vector_set_metadata(&temp_vec, metadata_keys[i], metadata_values[i]) != 0) {
@@ -3789,7 +4669,6 @@ int db_update_vector_metadata(GV_Database *db, size_t vector_index,
             }
         }
 
-        GV_Metadata *old_metadata = soa_storage_get_metadata(db->soa_storage, vector_index);
         GV_Metadata *old_metadata_copy = NULL;
         if (old_metadata != NULL && db->metadata_index != NULL) {
             GV_Metadata *current = old_metadata;
@@ -3825,7 +4704,8 @@ int db_update_vector_metadata(GV_Database *db, size_t vector_index,
         temp_vec.metadata = NULL;
 
         if (status == 0 && db->metadata_index != NULL) {
-            metadata_index_update(db->metadata_index, vector_index, old_metadata_copy, temp_vec.metadata);
+            GV_Metadata *new_metadata = soa_storage_get_metadata(db->soa_storage, vector_index);
+            metadata_index_update(db->metadata_index, vector_index, old_metadata_copy, new_metadata);
         }
 
         while (old_metadata_copy != NULL) {
@@ -4097,6 +4977,13 @@ int db_compact(GV_Database *db) {
     }
 
     db_compact_wal(db);
+
+    if (db->index_type == GV_INDEX_TYPE_IVFDISK && db->hnsw_index != NULL) {
+        ivfdisk_head_checkpoint_if_needed((GV_IVFDiskIndex *)db->hnsw_index);
+        GV_IVFDiskMaintenanceConfig mcfg;
+        ivfdisk_maintenance_config_init(&mcfg);
+        ivfdisk_maintenance_run((GV_IVFDiskIndex *)db->hnsw_index, &mcfg, NULL);
+    }
 
     pthread_rwlock_unlock(&db->rwlock);
     return 0;
@@ -4909,6 +5796,24 @@ int db_search_with_params(const GV_Database *db, const float *query_data, size_t
 
     if (db->index_type == GV_INDEX_TYPE_IVFFLAT && params->nprobe > 0 && db->hnsw_index != NULL) {
         GV_IVFFlatIndexPartial *idx = (GV_IVFFlatIndexPartial *)db->hnsw_index;
+        size_t saved_nprobe = idx->config.nprobe;
+        idx->config.nprobe = params->nprobe;
+        int r = db_search(db, query_data, k, results, distance_type);
+        idx->config.nprobe = saved_nprobe;
+        return r;
+    }
+
+    if (db->index_type == GV_INDEX_TYPE_IVFDISK && params->nprobe > 0 && db->hnsw_index != NULL) {
+        GV_IVFDiskIndex *idx = (GV_IVFDiskIndex *)db->hnsw_index;
+        size_t saved_nprobe = ivfdisk_get_nprobe(idx);
+        ivfdisk_set_nprobe(idx, params->nprobe);
+        int r = db_search(db, query_data, k, results, distance_type);
+        ivfdisk_set_nprobe(idx, saved_nprobe);
+        return r;
+    }
+
+    if (db->index_type == GV_INDEX_TYPE_IVFSQ8 && params->nprobe > 0 && db->hnsw_index != NULL) {
+        GV_IVFSQ8IndexPartial *idx = (GV_IVFSQ8IndexPartial *)db->hnsw_index;
         size_t saved_nprobe = idx->config.nprobe;
         idx->config.nprobe = params->nprobe;
         int r = db_search(db, query_data, k, results, distance_type);

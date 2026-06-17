@@ -1210,6 +1210,29 @@ int gv_hnsw_delete(void *index_ptr, size_t node_index) {
     return 0;
 }
 
+int gv_hnsw_delete_by_vector_index(void *index_ptr, size_t vector_index) {
+    if (!index_ptr) {
+        return -1;
+    }
+    GV_HNSWIndex *index = (GV_HNSWIndex *)index_ptr;
+    if (index->soa_storage == NULL) {
+        return -1;
+    }
+    for (size_t i = 0; i < index->count; ++i) {
+        if (index->nodes[i].deleted) {
+            continue;
+        }
+        if (index->nodes[i].vector_index != vector_index) {
+            continue;
+        }
+        if (gv_hnsw_delete(index_ptr, i) != 0) {
+            return -1;
+        }
+        return soa_storage_mark_deleted(index->soa_storage, vector_index);
+    }
+    return -1;
+}
+
 int gv_hnsw_update(void *index_ptr, size_t node_index, const float *new_data, size_t dimension) {
     if (!index_ptr || !new_data) return -1;
     GV_HNSWIndex *index = (GV_HNSWIndex *)index_ptr;
@@ -1282,7 +1305,8 @@ int gv_hnsw_save(const void *index_ptr, FILE *out, uint32_t version) {
     return 0;
 }
 
-int gv_hnsw_load(void **index_ptr, FILE *in, size_t dimension, uint32_t version) {
+int gv_hnsw_load(void **index_ptr, FILE *in, size_t dimension, uint32_t version,
+                 GV_SoAStorage *soa_storage) {
     if (!index_ptr || !in || dimension == 0) return -1;
 
     uint32_t M = 0, efConstruction = 0, efSearch = 0, maxLevel = 0;
@@ -1295,7 +1319,7 @@ int gv_hnsw_load(void **index_ptr, FILE *in, size_t dimension, uint32_t version)
     if (read_u64(in, &entry_point_idx) != 0) return -1;
 
     GV_HNSWConfig config = {.M = M, .efConstruction = efConstruction, .efSearch = efSearch, .maxLevel = maxLevel};
-    void *idx = gv_hnsw_create(dimension, &config, NULL);
+    void *idx = gv_hnsw_create(dimension, &config, soa_storage);
     if (!idx) return -1;
     GV_HNSWIndex *hnsw = (GV_HNSWIndex *)idx;
 

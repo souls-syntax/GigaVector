@@ -127,6 +127,15 @@ size_t gv_hnsw_count(const void *index);
 int gv_hnsw_delete(void *index, size_t node_index);
 
 /**
+ * @brief Delete a vector from the HNSW index by its SoA storage vector index.
+ *
+ * @param index HNSW index instance; must be non-NULL.
+ * @param vector_index SoA storage vector index.
+ * @return 0 on success, -1 on invalid arguments or vector not found.
+ */
+int gv_hnsw_delete_by_vector_index(void *index, size_t vector_index);
+
+/**
  * @brief Update a vector in the HNSW index by its node index.
  *
  * @param index HNSW index instance; must be non-NULL.
@@ -154,9 +163,11 @@ int gv_hnsw_save(const void *index, FILE *out, uint32_t version);
  * @param in File stream opened for reading.
  * @param dimension Vector dimensionality.
  * @param version File format version.
+ * @param soa_storage Optional SoA storage to populate; if NULL, creates a new one.
  * @return 0 on success, -1 on error.
  */
-int gv_hnsw_load(void **index_ptr, FILE *in, size_t dimension, uint32_t version);
+int gv_hnsw_load(void **index_ptr, FILE *in, size_t dimension, uint32_t version,
+                 GV_SoAStorage *soa_storage);
 
 #ifdef __cplusplus
 }

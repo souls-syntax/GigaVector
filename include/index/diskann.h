@@ -2,6 +2,9 @@
 #define GIGAVECTOR_GV_DISKANN_H
 #include <stddef.h>
 #include <stdint.h>
+
+struct GV_DiskPageCache;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -95,6 +98,9 @@ int diskann_get_stats(const GV_DiskANNIndex *index, GV_DiskANNStats *stats);
  */
 int diskann_save(const GV_DiskANNIndex *index, const char *filepath);
 GV_DiskANNIndex *diskann_load(const char *filepath, const GV_DiskANNConfig *config);
+
+/** Attach a shared LRU byte cache (not owned by the index). */
+void diskann_attach_page_cache(GV_DiskANNIndex *index, struct GV_DiskPageCache *cache);
 
 /**
  * @brief Return the number of stored items.

@@ -42,6 +42,14 @@ static size_t size_min(size_t a, size_t b)
     return a < b ? a : b;
 }
 
+/* IVFDisk on-disk index (GV_INDEX_TYPE_IVFDISK == 11) */
+#define GV_OPTIMIZER_IVFDISK 11
+
+static int is_ivf_disk_index(int index_type)
+{
+    return index_type == GV_OPTIMIZER_IVFDISK;
+}
+
 /* ef_search recommendation (used internally and in public API) */
 static size_t compute_ef_search(const GV_QueryOptimizer *opt, size_t k)
 {
@@ -78,6 +86,13 @@ static size_t compute_nprobe(const GV_QueryOptimizer *opt)
         nprobe = size_max(16, n / 20000);
     }
 
+    if (is_ivf_disk_index(opt->stats.index_type)) {
+        nprobe = size_max(nprobe, 8);
+        if (n >= 100000) {
+            nprobe = size_max(nprobe, 32);
+        }
+    }
+
     /* Hard cap */
     nprobe = size_min(nprobe, opt->nprobe_cap);
 
@@ -85,6 +100,15 @@ static size_t compute_nprobe(const GV_QueryOptimizer *opt)
 }
 
 /* Cost estimation helpers */
+static double estimate_ivfdisk_cost(const GV_CollectionStats *st, size_t k, size_t nprobe)
+{
+    double lists = (double)nprobe;
+    double per_list = st->total_vectors > 0
+                          ? (double)st->total_vectors / (double)size_max(nprobe, 1)
+                          : (double)k;
+    return lists * per_list * (double)st->dimension * 2.0;
+}
+
 static double estimate_exact_scan_cost(const GV_CollectionStats *st)
 {
     return (double)st->total_vectors * (double)st->dimension;
@@ -193,7 +217,9 @@ int optimizer_plan(const GV_QueryOptimizer *opt, size_t k,
         plan->use_metadata_index = has_filter ? 1 : 0;
         plan->oversample_k      = 0;
 
-        plan->estimated_cost   = estimate_index_cost(&opt->stats, k, ef);
+        plan->estimated_cost   = is_ivf_disk_index(opt->stats.index_type)
+                                     ? estimate_ivfdisk_cost(&opt->stats, k, nprobe)
+                                     : estimate_index_cost(&opt->stats, k, ef);
 
         /* Recall estimate: higher ef -> better recall, rough heuristic */
         {

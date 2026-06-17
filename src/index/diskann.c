@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "core/compat.h"
+#include "storage/disk_layout.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -52,6 +53,7 @@ static ssize_t pwrite(int fd, const void *buf, size_t count, long long offset) {
 #endif
 
 #include "index/diskann.h"
+#include "storage/disk_page_cache.h"
 #include "core/utils.h"
 
 #define DISKANN_MAGIC           0x44414E4E  /* "DANN" */
@@ -61,7 +63,7 @@ static ssize_t pwrite(int fd, const void *buf, size_t count, long long offset) {
 #define DISKANN_DEFAULT_BUILD_BW  128
 #define DISKANN_DEFAULT_SEARCH_BW 64
 #define DISKANN_DEFAULT_CACHE_MB  256
-#define DISKANN_DEFAULT_SECTOR    4096
+#define DISKANN_DEFAULT_SECTOR    GV_DISK_SECTOR_SIZE_DEFAULT
 #define DISKANN_PQ_NBITS          8
 #define DISKANN_PQ_KSUB           256  /* 2^8 */
 #define DISKANN_INITIAL_CAPACITY  1024
@@ -128,6 +130,7 @@ struct GV_DiskANNIndex {
 
     /* LRU cache */
     DiskANN_Cache cache;
+    GV_DiskPageCache *shared_page_cache;
 
     /* Statistics */
     size_t disk_reads;
@@ -146,6 +149,8 @@ static void diskann_cache_init(DiskANN_Cache *cache, size_t max_mb, size_t vecto
 static float *diskann_cache_get(DiskANN_Cache *cache, size_t page_id);
 static void diskann_cache_put(DiskANN_Cache *cache, size_t page_id, const float *data);
 static void diskann_cache_destroy(DiskANN_Cache *cache);
+static float *diskann_page_cache_lookup(GV_DiskANNIndex *index, size_t page_id);
+static void diskann_page_cache_store(GV_DiskANNIndex *index, size_t page_id, const float *data);
 
 static int diskann_disk_open(GV_DiskANNIndex *index);
 static int diskann_disk_write_vector(GV_DiskANNIndex *index, size_t vec_index, const float *data);
@@ -452,6 +457,34 @@ static void diskann_cache_put(DiskANN_Cache *cache, size_t page_id, const float 
     cache->count++;
 }
 
+static float *diskann_page_cache_lookup(GV_DiskANNIndex *index, size_t page_id)
+{
+    if (index->shared_page_cache) {
+        char key[128];
+        snprintf(key, sizeof(key), "dann:%p:%zu", (void *)index, page_id);
+        size_t len = 0;
+        const uint8_t *data = gv_disk_page_cache_lookup(index->shared_page_cache, key, &len);
+        if (data && len == index->cache.page_data_bytes) {
+            return (float *)data;
+        }
+        index->cache.misses++;
+        return NULL;
+    }
+    return diskann_cache_get(&index->cache, page_id);
+}
+
+static void diskann_page_cache_store(GV_DiskANNIndex *index, size_t page_id, const float *data)
+{
+    if (index->shared_page_cache) {
+        char key[128];
+        snprintf(key, sizeof(key), "dann:%p:%zu", (void *)index, page_id);
+        gv_disk_page_cache_insert(index->shared_page_cache, key,
+                                  (const uint8_t *)data, index->cache.page_data_bytes);
+        return;
+    }
+    diskann_cache_put(&index->cache, page_id, data);
+}
+
 static void diskann_cache_destroy(DiskANN_Cache *cache) {
     for (size_t i = 0; i < DISKANN_CACHE_BUCKETS; i++) {
         DiskANN_CachePage *cur = cache->buckets[i];
@@ -504,7 +537,7 @@ static int diskann_disk_read_vector(GV_DiskANNIndex *index, size_t vec_index, fl
     size_t page_id = vec_index / index->vectors_per_page;
     size_t offset_in_page = vec_index % index->vectors_per_page;
 
-    float *cached_page = diskann_cache_get(&index->cache, page_id);
+    float *cached_page = diskann_page_cache_lookup(index, page_id);
     if (cached_page) {
         memcpy(out, &cached_page[offset_in_page * index->dimension],
                index->dimension * sizeof(float));
@@ -554,7 +587,7 @@ static int diskann_disk_read_vector(GV_DiskANNIndex *index, size_t vec_index, fl
         }
     }
 
-    diskann_cache_put(&index->cache, page_id, page_buf);
+    diskann_page_cache_store(index, page_id, page_buf);
 
     memcpy(out, &page_buf[offset_in_page * index->dimension],
            index->dimension * sizeof(float));
@@ -816,7 +849,7 @@ void diskann_config_init(GV_DiskANNConfig *config) {
     config->pq_dim = 0;
     config->data_path = NULL;
     config->cache_size_mb = DISKANN_DEFAULT_CACHE_MB;
-    config->sector_size = DISKANN_DEFAULT_SECTOR;
+    config->sector_size = gv_disk_default_sector_size();
 }
 
 GV_DiskANNIndex *diskann_create(size_t dimension, const GV_DiskANNConfig *config) {
@@ -833,13 +866,13 @@ GV_DiskANNIndex *diskann_create(size_t dimension, const GV_DiskANNConfig *config
         index->alpha = config->alpha > 0.0f ? config->alpha : DISKANN_DEFAULT_ALPHA;
         index->build_beam_width = config->build_beam_width > 0 ? config->build_beam_width : DISKANN_DEFAULT_BUILD_BW;
         index->search_beam_width = config->search_beam_width > 0 ? config->search_beam_width : DISKANN_DEFAULT_SEARCH_BW;
-        index->sector_size = config->sector_size > 0 ? config->sector_size : DISKANN_DEFAULT_SECTOR;
+        index->sector_size = gv_disk_normalize_sector_size(config->sector_size);
     } else {
         index->max_degree = DISKANN_DEFAULT_DEGREE;
         index->alpha = DISKANN_DEFAULT_ALPHA;
         index->build_beam_width = DISKANN_DEFAULT_BUILD_BW;
         index->search_beam_width = DISKANN_DEFAULT_SEARCH_BW;
-        index->sector_size = DISKANN_DEFAULT_SECTOR;
+        index->sector_size = gv_disk_default_sector_size();
     }
 
     size_t vec_bytes = dimension * sizeof(float);
@@ -1327,6 +1360,12 @@ int diskann_get_stats(const GV_DiskANNIndex *index, GV_DiskANNStats *stats) {
     stats->disk_usage_bytes = index->count * slot_size;
 
     return 0;
+}
+
+void diskann_attach_page_cache(GV_DiskANNIndex *index, GV_DiskPageCache *cache)
+{
+    if (!index) return;
+    index->shared_page_cache = cache;
 }
 
 size_t diskann_count(const GV_DiskANNIndex *index) {

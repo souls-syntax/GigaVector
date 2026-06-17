@@ -12,6 +12,8 @@
 #include "index/ivfpq.h"
 #include "index/flat.h"
 #include "index/ivfflat.h"
+#include "index/ivfdisk.h"
+#include "index/ivfsq8.h"
 #include "index/ivfsq8.h"
 #include "index/ivfturboquant.h"
 #include "index/pq.h"
@@ -36,8 +38,16 @@ typedef enum {
     GV_INDEX_TYPE_PQ      = 6,
     GV_INDEX_TYPE_LSH     = 7,
     GV_INDEX_TYPE_IVFSQ8  = 8,
-    GV_INDEX_TYPE_IVFTURBOQUANT = 9
+    GV_INDEX_TYPE_IVFTURBOQUANT = 9,
+    GV_INDEX_TYPE_DISKANN = 10,  /**< On-disk Vamana graph (standalone API; Phase 0 suggest). */
+    GV_INDEX_TYPE_IVFDISK = 11   /**< IVF head + on-disk posting lists per centroid. */
 } GV_IndexType;
+
+/** Default metadata bytes assumed per vector when estimating RAM for index_suggest(). */
+#define GV_INDEX_SUGGEST_METADATA_OVERHEAD 64u
+
+/** Dataset estimated size above this fraction of RAM budget triggers on-disk suggest. */
+#define GV_INDEX_SUGGEST_RAM_THRESHOLD_RATIO 0.7
 
 typedef struct {
     size_t max_memory_bytes;           /**< Maximum memory usage in bytes (0 = unlimited). */
@@ -189,8 +199,9 @@ GV_Database *db_open_with_ivfpq_config(const char *filepath, size_t dimension,
 /**
  * @brief Suggest an index type based on dimension and expected collection size.
  *
- * Heuristic:
- *  - Small datasets (<= 20k) and low/moderate dimensions (<= 64): KDTREE.
+ * Heuristic (when no RAM budget is supplied):
+ *  - Small datasets (<= 500): FLAT.
+ *  - Medium datasets (<= 20k) and low dimensions (<= 64): KDTREE.
  *  - Very large datasets (>= 500k) and high dimensions (>= 128): IVFPQ.
  *  - Otherwise: HNSW.
  *
@@ -199,6 +210,28 @@ GV_Database *db_open_with_ivfpq_config(const char *filepath, size_t dimension,
  * @return Suggested GV_IndexType.
  */
 GV_IndexType index_suggest(size_t dimension, size_t expected_count);
+
+/**
+ * @brief Estimate bytes per vector for RAM budgeting (float payload + metadata overhead).
+ *
+ * @param dimension Vector dimensionality.
+ * @param metadata_bytes_per_vector Extra bytes per vector for metadata; 0 uses default.
+ * @return Estimated bytes per stored vector.
+ */
+size_t index_suggest_bytes_per_vector(size_t dimension, size_t metadata_bytes_per_vector);
+
+/**
+ * @brief Suggest index type with an optional RAM budget.
+ *
+ * When @p max_memory_bytes is non-zero and estimated dataset size exceeds
+ * @ref GV_INDEX_SUGGEST_RAM_THRESHOLD_RATIO of the budget, returns
+ * @c GV_INDEX_TYPE_IVFDISK or @c GV_INDEX_TYPE_DISKANN instead of in-memory types.
+ *
+ * @param max_memory_bytes RAM budget in bytes; 0 disables RAM-aware selection.
+ * @param bytes_per_vector Bytes per vector estimate; 0 derives from @p dimension.
+ */
+GV_IndexType index_suggest_with_budget(size_t dimension, size_t expected_count,
+                                       size_t max_memory_bytes, size_t bytes_per_vector);
 
 /**
  * @brief Retrieve current runtime statistics for a database.
@@ -239,6 +272,18 @@ void db_set_cosine_normalized(GV_Database *db, int enabled);
  */
 GV_Database *db_open_from_memory(const void *data, size_t size,
                                     size_t dimension, GV_IndexType index_type);
+
+/**
+ * @brief Open a read-only IVFDisk snapshot from memory.
+ *
+ * The GVDB snapshot bytes are the same as db_save(); posting lists and the
+ * catalog must exist on disk at @p ivfdisk_data_dir (typically @c {path}.ivfdisk/).
+ *
+ * @param ivfdisk_data_dir Directory containing posting_catalog.bin and segments.
+ */
+GV_Database *db_open_from_memory_ivfdisk(const void *data, size_t size,
+                                            size_t dimension,
+                                            const char *ivfdisk_data_dir);
 
 /**
  * @brief Open a database by memory-mapping an existing snapshot file.
@@ -310,6 +355,12 @@ GV_Database *db_open_with_ivfflat_config(const char *filepath, size_t dimension,
                                              GV_IndexType index_type, const GV_IVFFlatConfig *config);
 
 /**
+ * @brief Open a database with IVFDisk configuration (requires @p filepath for on-disk data).
+ */
+GV_Database *db_open_with_ivfdisk_config(const char *filepath, size_t dimension,
+                                             GV_IndexType index_type, const GV_IVFDiskConfig *config);
+
+/**
  * @brief Open an in-memory database with PQ configuration.
  *
  * @param filepath Optional file path string to associate with the database.
@@ -343,6 +394,34 @@ GV_Database *db_open_with_lsh_config(const char *filepath, size_t dimension,
  * @return 0 on success, -1 on error.
  */
 int db_ivfflat_train(GV_Database *db, const float *data, size_t count, size_t dimension);
+
+/**
+ * @brief Train IVFDisk coarse centroids with provided training data.
+ */
+int db_ivfdisk_train(GV_Database *db, const float *data, size_t count, size_t dimension);
+
+/**
+ * @brief Open an in-memory database with IVF-SQ8 configuration.
+ *
+ * @param filepath Optional file path string to associate with the database.
+ * @param dimension Expected dimensionality.
+ * @param index_type Must be GV_INDEX_TYPE_IVFSQ8 for config to apply.
+ * @param config IVF-SQ8 configuration; NULL to use defaults.
+ * @return Allocated database instance or NULL on failure.
+ */
+GV_Database *db_open_with_ivfsq8_config(const char *filepath, size_t dimension,
+                                        GV_IndexType index_type, const GV_IVFSQ8Config *config);
+
+/**
+ * @brief Train IVF-SQ8 coarse centroids and scalar quantizer.
+ *
+ * @param db Database; must be GV_INDEX_TYPE_IVFSQ8.
+ * @param data Contiguous floats of size count * dimension.
+ * @param count Number of training vectors.
+ * @param dimension Vector dimension; must match db->dimension.
+ * @return 0 on success, -1 on invalid args or training failure.
+ */
+int db_ivfsq8_train(GV_Database *db, const float *data, size_t count, size_t dimension);
 
 /**
  * @brief Open an in-memory database with IVF-SQ8 configuration.
@@ -455,6 +534,9 @@ int db_update_vector(GV_Database *db, size_t vector_index, const float *new_data
 
 /**
  * @brief Update metadata for a vector in the database by its index.
+ *
+ * Merges the given keys into existing vector metadata (same keys are replaced;
+ * other keys are preserved).
  *
  * @param db Target database; must be non-NULL.
  * @param vector_index Index of the vector to update (0-based insertion order).
@@ -701,6 +783,16 @@ void db_disable_wal(GV_Database *db);
  * @return 0 on success, -1 on error or if WAL is disabled.
  */
 int db_wal_dump(const GV_Database *db, FILE *out);
+
+/**
+ * @brief Apply one serialized WAL record to the database (and append to local WAL).
+ */
+int db_apply_wal_record(GV_Database *db, const uint8_t *record, size_t len);
+
+/**
+ * @brief Return the WAL file path, or NULL if WAL is disabled.
+ */
+const char *db_wal_path(const GV_Database *db);
 
 /**
  * @brief Start background compaction thread.
