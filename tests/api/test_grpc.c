@@ -249,6 +249,7 @@ static int test_grpc_encode_ivfdisk_train_request(void) {
 }
 
 static int test_grpc_client_ivfdisk_train(void) {
+#ifndef _WIN32
     char db_path[256];
     if (gv_test_make_temp_path(db_path, sizeof(db_path), "gv_grpc_ivf", ".gv") != 0) return 0;
     remove(db_path);
@@ -294,6 +295,10 @@ static int test_grpc_client_ivfdisk_train(void) {
     db_close(db);
     remove(db_path);
     return 0;
+#else
+    printf("(SKIPPED - POSIX gRPC client not available on Windows)\n");
+    return 0;
+#endif
 }
 
 static int test_grpc_get_stats_initial(void) {
@@ -387,12 +392,13 @@ static int test_grpc_msg_type_values(void) {
     ASSERT(GV_MSG_STATS == 8, "GV_MSG_STATS should be 8");
     ASSERT(GV_MSG_HEALTH == 9, "GV_MSG_HEALTH should be 9");
     ASSERT(GV_MSG_SAVE == 10, "GV_MSG_SAVE should be 10");
-    ASSERT(GV_MSG_IVFDISK_TRAIN == 13, "GV_MSG_IVFDISK_TRAIN should be 13");
+    ASSERT(GV_MSG_IVFDISK_TRAIN == 11, "GV_MSG_IVFDISK_TRAIN should be 11");
     ASSERT(GV_MSG_RESPONSE == 128, "GV_MSG_RESPONSE should be 128");
     return 0;
 }
 
 static int test_grpc_client_search(void) {
+#ifndef _WIN32
     GV_Database *db = db_open(NULL, 4, GV_INDEX_TYPE_FLAT);
     ASSERT(db != NULL, "create test database");
 
@@ -427,6 +433,10 @@ static int test_grpc_client_search(void) {
     grpc_destroy(server);
     db_close(db);
     return 0;
+#else
+    printf("(SKIPPED - POSIX gRPC client not available on Windows)\n");
+    return 0;
+#endif
 }
 
 typedef int (*test_fn)(void);

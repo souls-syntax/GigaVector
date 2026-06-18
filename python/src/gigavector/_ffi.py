@@ -76,21 +76,14 @@ typedef struct {
     size_t cache_size_mb;
     size_t sector_size;
     size_t max_list_bytes;
+    size_t head_wal_checkpoint_bytes;
+    size_t head_checkpoint_interval_sec;
     float head_ratio;
     float border_ratio;
     int use_hnsw_head;
     int use_sq8;
     const char *data_dir;
 } GV_IVFDiskConfig;
-
-typedef struct {
-    size_t nlist;
-    size_t nprobe;
-    size_t train_iters;
-    int use_cosine;
-    int per_dimension;
-    size_t default_rerank;
-} GV_IVFSQ8Config;
 
 typedef struct {
     size_t nlist;
@@ -193,8 +186,6 @@ GV_Database *gv_db_open_with_ivfpq_config(const char *filepath, size_t dimension
 GV_Database *gv_db_open_with_ivfflat_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_IVFFlatConfig *config);
 GV_Database *gv_db_open_with_ivfdisk_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_IVFDiskConfig *config);
 GV_Database *gv_db_open_with_ivfsq8_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_IVFSQ8Config *config);
-GV_Database *gv_db_open_with_ivfsq8_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_IVFSQ8Config *config);
-GV_Database *gv_db_open_with_ivfturboquant_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_IVFTurboQuantConfig *config);
 GV_Database *gv_db_open_with_ivfturboquant_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_IVFTurboQuantConfig *config);
 GV_Database *gv_db_open_with_pq_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_PQConfig *config);
 GV_Database *gv_db_open_with_lsh_config(const char *filepath, size_t dimension, GV_IndexType index_type, const GV_LSHConfig *config);
@@ -225,8 +216,6 @@ int gv_db_ivfpq_train(GV_Database *db, const float *data, size_t count, size_t d
 int gv_db_ivfflat_train(GV_Database *db, const float *data, size_t count, size_t dimension);
 int gv_db_ivfdisk_train(GV_Database *db, const float *data, size_t count, size_t dimension);
 int gv_db_ivfsq8_train(GV_Database *db, const float *data, size_t count, size_t dimension);
-int gv_db_ivfsq8_train(GV_Database *db, const float *data, size_t count, size_t dimension);
-int gv_db_ivfturboquant_train(GV_Database *db, const float *data, size_t count, size_t dimension);
 int gv_db_ivfturboquant_train(GV_Database *db, const float *data, size_t count, size_t dimension);
 int gv_db_pq_train(GV_Database *db, const float *data, size_t count, size_t dimension);
 int gv_db_add_vectors(GV_Database *db, const float *data, size_t count, size_t dimension);
@@ -1769,7 +1758,7 @@ typedef enum {
     GV_MSG_STATS = 8,
     GV_MSG_HEALTH = 9,
     GV_MSG_SAVE = 10,
-    GV_MSG_IVFDISK_TRAIN = 13,
+    GV_MSG_IVFDISK_TRAIN = 11,
     GV_MSG_RESPONSE = 128
 } GV_GrpcMsgType;
 

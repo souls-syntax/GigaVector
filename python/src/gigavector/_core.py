@@ -35,9 +35,9 @@ class IndexType(IntEnum):
     PQ = 6
     LSH = 7
     IVFSQ8 = 8
-    IVFSQ8 = 8
     IVFTURBOQUANT = 9
-    IVFTURBOQUANT = 9
+    DISKANN = 10
+    IVFDISK = 11
 
 
 class DistanceType(IntEnum):
@@ -46,6 +46,23 @@ class DistanceType(IntEnum):
     DOT_PRODUCT = 2
     MANHATTAN = 3
     HAMMING = 4
+
+
+def suggest_index(
+    dimension: int,
+    expected_count: int,
+    *,
+    max_memory_bytes: int = 0,
+    bytes_per_vector: int = 0,
+) -> IndexType:
+    """Recommend an index type for the given workload."""
+    if max_memory_bytes > 0 or bytes_per_vector > 0:
+        idx = lib.gv_index_suggest_with_budget(
+            dimension, expected_count, max_memory_bytes, bytes_per_vector
+        )
+    else:
+        idx = lib.gv_index_suggest(dimension, expected_count)
+    return IndexType(int(idx))
 
 
 @dataclass(frozen=True)
@@ -122,6 +139,8 @@ class IVFDiskConfig:
     cache_size_mb: int = 64
     sector_size: int = 4096
     max_list_bytes: int = 64 * 1024 * 1024
+    head_wal_checkpoint_bytes: int = 10 * 1024 * 1024
+    head_checkpoint_interval_sec: int = 300
     head_ratio: float = 0.2
     border_ratio: float = 1.15
     use_hnsw_head: bool = False
@@ -136,35 +155,6 @@ class IVFSQ8Config:
     use_cosine: bool = False
     per_dimension: bool = False
     default_rerank: int = 200
-
-
-class TurboQuantRotation(IntEnum):
-    AUTO = 0
-    FHWT = 1
-    QR = 2
-
-
-@dataclass
-class TurboQuantConfig:
-    bits: int = 8
-    projections: int = 0
-    seed: int = 42
-    use_qjl: bool = True
-    rotation: TurboQuantRotation = TurboQuantRotation.AUTO
-
-
-@dataclass
-class IVFTurboQuantConfig:
-    nlist: int = 64
-    nprobe: int = 4
-    train_iters: int = 15
-    use_cosine: bool = False
-    default_rerank: int = 200
-    turbo: TurboQuantConfig | None = None
-
-    def __post_init__(self) -> None:
-        if self.turbo is None:
-            self.turbo = TurboQuantConfig()
 
 
 class TurboQuantRotation(IntEnum):
@@ -324,7 +314,6 @@ class Database:
             ivfpq_config: Optional IVFPQ configuration. Only used when index is IVFPQ.
             ivfflat_config: Optional IVF-Flat configuration. Only used when index is IVFFLAT.
             ivfsq8_config: Optional IVF-SQ8 configuration. Only used when index is IVFSQ8.
-            ivfsq8_config: Optional IVF-SQ8 configuration. Only used when index is IVFSQ8.
             ivfturboquant_config: Optional IVF-TurboQuant configuration. Only used when index is IVFTURBOQUANT.
             pq_config: Optional PQ configuration. Only used when index is PQ.
             lsh_config: Optional LSH configuration. Only used when index is LSH.
@@ -385,6 +374,8 @@ class Database:
                 "cache_size_mb": ivfdisk_config.cache_size_mb,
                 "sector_size": ivfdisk_config.sector_size,
                 "max_list_bytes": ivfdisk_config.max_list_bytes,
+                "head_wal_checkpoint_bytes": ivfdisk_config.head_wal_checkpoint_bytes,
+                "head_checkpoint_interval_sec": ivfdisk_config.head_checkpoint_interval_sec,
                 "head_ratio": ivfdisk_config.head_ratio,
                 "border_ratio": ivfdisk_config.border_ratio,
                 "use_hnsw_head": 1 if ivfdisk_config.use_hnsw_head else 0,

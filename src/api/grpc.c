@@ -167,13 +167,18 @@ int grpc_encode_add_request(const float *data, size_t dimension,
 
 int grpc_encode_ivfdisk_train_request(const float *data, size_t count, size_t dimension,
                                       uint8_t *buf, size_t buf_size, size_t *out_len) {
-    (void)data;
-    (void)count;
-    (void)dimension;
-    (void)buf;
-    (void)buf_size;
-    (void)out_len;
-    return GV_GRPC_ERROR_NOT_RUNNING;
+    if (!data || !buf || !out_len || count == 0 || dimension == 0) return GV_GRPC_ERROR_NULL;
+
+    size_t needed = 8 + count * dimension * sizeof(float);
+    if (buf_size < needed) return GV_GRPC_ERROR_CONFIG;
+
+    write_u32_be(buf, (uint32_t)count);
+    write_u32_be(buf + 4, (uint32_t)dimension);
+    for (size_t i = 0; i < count * dimension; i++) {
+        write_float_be(buf + 8 + i * 4, data[i]);
+    }
+    *out_len = needed;
+    return GV_GRPC_OK;
 }
 
 int grpc_client_ivfdisk_train(const char *host, uint16_t port,
@@ -367,6 +372,36 @@ struct GV_GrpcServer {
     uint64_t latency_samples;
     pthread_mutex_t stats_mutex;
 };
+
+#define GV_GRPC_MAX_SEARCH_K 65536u
+
+static int grpc_dimension_matches(const GV_GrpcServer *server, uint32_t dimension) {
+    return server && server->db && dimension == (uint32_t)server->db->dimension;
+}
+
+static int grpc_validate_search_k(uint32_t k, size_t *out_k) {
+    if (k == 0 || k > GV_GRPC_MAX_SEARCH_K) {
+        return -1;
+    }
+    *out_k = (size_t)k;
+    return 0;
+}
+
+static int grpc_validate_batch_result_count(uint32_t qcount, uint32_t k, size_t *out_total) {
+    if (qcount == 0 || qcount > GV_GRPC_MAX_SEARCH_K) {
+        return -1;
+    }
+    size_t per_query_k;
+    if (grpc_validate_search_k(k, &per_query_k) != 0) {
+        return -1;
+    }
+    size_t total = (size_t)qcount * per_query_k;
+    if (total / (size_t)qcount != per_query_k || total > GV_GRPC_MAX_SEARCH_K) {
+        return -1;
+    }
+    *out_total = total;
+    return 0;
+}
 
 static const GV_GrpcConfig DEFAULT_GRPC_CONFIG = {
     .port = 50051,
@@ -565,6 +600,19 @@ static void handle_search(GV_GrpcServer *server, int fd,
     uint32_t k = read_u32_be(msg->payload + 4);
     int32_t distance_type = (int32_t)read_u32_be(msg->payload + 8);
 
+    if (!grpc_dimension_matches(server, dimension)) {
+        send_error_response(fd, msg->request_id, -1, "dimension mismatch");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
+    size_t search_k;
+    if (grpc_validate_search_k(k, &search_k) != 0) {
+        send_error_response(fd, msg->request_id, -1, "invalid k");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
     size_t expected = 12 + (size_t)dimension * sizeof(float);
     if (msg->payload_len < expected) {
         send_error_response(fd, msg->request_id, -1, "incomplete query data");
@@ -582,7 +630,7 @@ static void handle_search(GV_GrpcServer *server, int fd,
         query[i] = read_float_be(msg->payload + 12 + i * 4);
     }
 
-    GV_SearchResult *results = calloc(k, sizeof(GV_SearchResult));
+    GV_SearchResult *results = calloc(search_k, sizeof(GV_SearchResult));
     if (!results) {
         free(query);
         send_error_response(fd, msg->request_id, -1, "out of memory");
@@ -590,7 +638,7 @@ static void handle_search(GV_GrpcServer *server, int fd,
         return;
     }
 
-    int found = db_search(server->db, query, (size_t)k, results,
+    int found = db_search(server->db, query, search_k, results,
                               (GV_DistanceType)distance_type);
     free(query);
 
@@ -802,6 +850,19 @@ static void handle_batch_search(GV_GrpcServer *server, int fd,
     uint32_t k = read_u32_be(msg->payload + 8);
     int32_t distance_type = (int32_t)read_u32_be(msg->payload + 12);
 
+    if (!grpc_dimension_matches(server, dimension)) {
+        send_error_response(fd, msg->request_id, -1, "dimension mismatch");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
+    size_t total_results;
+    if (grpc_validate_batch_result_count(qcount, k, &total_results) != 0) {
+        send_error_response(fd, msg->request_id, -1, "invalid batch search params");
+        GV_ATOMIC_INC(&server->errors);
+        return;
+    }
+
     size_t total_floats = (size_t)qcount * (size_t)dimension;
     size_t expected = 16 + total_floats * sizeof(float);
     if (msg->payload_len < expected) {
@@ -820,7 +881,6 @@ static void handle_batch_search(GV_GrpcServer *server, int fd,
         queries[i] = read_float_be(msg->payload + 16 + i * 4);
     }
 
-    size_t total_results = (size_t)qcount * (size_t)k;
     GV_SearchResult *results = calloc(total_results, sizeof(GV_SearchResult));
     if (!results) {
         free(queries);
